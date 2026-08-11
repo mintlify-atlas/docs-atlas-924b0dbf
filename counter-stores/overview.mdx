@@ -1,7 +1,7 @@
 ---
 title: "Counter Stores: Distributed Rate Limiting Across Instances"
 sidebarTitle: "Overview"
-description: "ThrottlingTroll counter stores let you share rate limit counters across all your service instances using Redis, Azure Table Storage, IDistributedCache, or EF Core."
+description: "ThrottlingTroll counter stores let you share rate limit counters across service instances using Redis, Azure Table Storage, IDistributedCache, or EF Core."
 ---
 
 By default, ThrottlingTroll tracks request counts using `MemoryCacheCounterStore`, an in-process store backed by the local memory cache. This works perfectly for single-instance deployments and local development, but in a horizontally-scaled environment each instance maintains its own independent counters — so a client can exceed your intended limit by hitting different pods or servers. To enforce consistent rate limits across all instances, you need a **distributed counter store**.

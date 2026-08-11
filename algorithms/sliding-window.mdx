@@ -30,6 +30,14 @@ Because the bucket boundaries roll forward continuously — old buckets expire a
   Computed as `Math.Ceiling(IntervalInSeconds / NumOfBuckets)` — the duration of a single bucket, rounded up. This is the minimum time a client must wait before the oldest full bucket expires and capacity becomes available again. ThrottlingTroll writes this value into the `Retry-After` response header automatically.
 </ParamField>
 
+<ParamField path="ShouldThrowOnFailures" type="bool" default="false">
+  Controls how ThrottlingTroll handles internal errors (e.g., a Redis timeout while reading the counter). When `false` (the default), the error is logged and the request is allowed to proceed. When `true`, the exception is rethrown and the request fails. Use `true` when enforcing the limit is more important than availability.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="false">
+  When `false` (the default), any request that matches an entry in `ThrottlingTrollConfig.AllowList` is exempt from this rule. Set to `true` to apply the rule unconditionally, even to allowlisted identities.
+</ParamField>
+
 ## Usage
 
 ### Programmatic configuration

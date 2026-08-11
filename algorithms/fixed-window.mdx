@@ -1,7 +1,7 @@
 ---
 title: "Fixed Window Rate Limiting Algorithm in ThrottlingTroll"
 sidebarTitle: "Fixed Window"
-description: "FixedWindowRateLimitMethod allows at most PermitLimit requests per IntervalInSeconds window. Simple, low-overhead, but susceptible to burst traffic at window boundaries."
+description: "FixedWindowRateLimitMethod allows at most PermitLimit requests per IntervalInSeconds window. Simple and low-overhead, but prone to boundary bursts."
 ---
 
 The Fixed Window algorithm is the simplest rate limiting strategy available in ThrottlingTroll. Time is divided into discrete, non-overlapping windows of `IntervalInSeconds` length. Each incoming request increments a counter for the current window, and if that counter exceeds `PermitLimit`, the request is rejected with `429 TooManyRequests`. When the window rolls over, the counter resets to zero and traffic is permitted again. Because the counter is a single integer keyed on the current window boundary, Fixed Window has the lowest storage and computation overhead of any algorithm in ThrottlingTroll — one counter read plus one atomic increment per request.

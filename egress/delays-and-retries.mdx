@@ -1,7 +1,7 @@
 ---
 title: "Automatic Retries and Delays for Egress Throttling"
 sidebarTitle: "Retries & Delays"
-description: "Configure ThrottlingTroll to automatically retry outbound HttpClient requests with delays when egress rate limits are exceeded, using MaxDelayInSeconds and ResponseFabric."
+description: "Use MaxDelayInSeconds and ResponseFabric to automatically retry throttled outbound HttpClient calls and handle upstream 429 responses in ThrottlingTroll."
 ---
 
 When an egress limit is exceeded, the default behaviour is to return a `429 TooManyRequests` response immediately and let calling code decide what to do. For many use cases — burst traffic smoothing, polite retry loops, concurrency control — you want ThrottlingTroll to handle the wait-and-retry cycle automatically. Two mechanisms make this possible: `MaxDelayInSeconds` for locally-enforced limits, and `ResponseFabric` for full programmatic control including retrying on upstream 429 responses.
@@ -47,7 +47,7 @@ The delegate signature is:
 Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>
 ```
 
-Inside the delegate, setting `responseProxy.ShouldRetry = true` causes the handler to re-send the original request after the delegate returns. The handler reads the `Retry-After` header from the response to determine how long to wait before retrying; if no such header is present it defaults to 5 seconds.
+Inside the delegate, setting `responseProxy.ShouldRetry = true` causes the handler to re-send the original request after the delegate returns. **After the fabric returns**, the handler itself reads the `Retry-After` header from the response (via `responseProxy.Response.Headers`) to determine how long to wait before retrying; if no such header is present it defaults to 5 seconds. You should not add your own `Task.Delay` inside the fabric when using `ShouldRetry` — doing so would double the wait time.
 
 ### Retrying on Upstream 429
 
@@ -73,20 +73,18 @@ services.AddHttpClient("ExternalApi")
             ]
         };
 
-        // Automatically retry on 429 from upstream, respecting Retry-After
+        // Automatically retry on 429 from upstream, respecting Retry-After.
+        // The handler applies the Retry-After delay itself after this delegate returns —
+        // do NOT add Task.Delay here or the wait will be doubled.
         options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
         {
-            var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 5;
-
-            await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
-
             // Signal ThrottlingTroll to retry the request
             responseProxy.ShouldRetry = true;
         };
     });
 ```
 
-When `ShouldRetry` is `true`, the handler loops back and re-sends the `HttpRequestMessage`. The `responseProxy.RetryCount` property records how many retry attempts have been made so far for the current request, which you can use to bound the retry loop.
+When `ShouldRetry` is `true`, the handler reads the `Retry-After` header from `responseProxy.Response.Headers`, waits for that duration (defaulting to 5 seconds if absent), then loops back and re-sends the `HttpRequestMessage`. The `responseProxy.RetryCount` property records how many retry attempts have been made so far for the current request, which you can use to bound the retry loop.
 
 <Warning>
 Setting `ShouldRetry = true` unconditionally creates an infinite retry loop. Always guard it with a maximum retry count or a time budget:
@@ -101,9 +99,8 @@ options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cance
         return;
     }
 
-    var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 5;
-    await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
-
+    // The handler automatically waits for the Retry-After interval after
+    // this delegate returns — no manual Task.Delay needed here.
     responseProxy.ShouldRetry = true;
 };
 ```
@@ -135,7 +132,8 @@ services.AddHttpClient("ExternalApi")
             ]
         };
 
-        // Also retry if the upstream still returns 429
+        // Also retry if the upstream still returns 429.
+        // The handler applies the Retry-After delay automatically after this delegate returns.
         options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
         {
             if (responseProxy.RetryCount >= 5)
@@ -143,9 +141,6 @@ services.AddHttpClient("ExternalApi")
                 responseProxy.ShouldRetry = false;
                 return;
             }
-
-            var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 2;
-            await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
 
             responseProxy.ShouldRetry = true;
         };
@@ -172,12 +167,12 @@ services.AddHttpClient("ExternalApi")
                         PermitLimit = 5,
                         IntervalInSeconds = 1
                     },
-                    // This rule's fabric overrides the handler-level one
+                    // This rule's fabric overrides the handler-level one.
+                    // The handler applies the Retry-After delay automatically — no Task.Delay needed here.
                     ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
                     {
                         if (responseProxy.RetryCount < 2)
                         {
-                            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
                             responseProxy.ShouldRetry = true;
                         }
                     }

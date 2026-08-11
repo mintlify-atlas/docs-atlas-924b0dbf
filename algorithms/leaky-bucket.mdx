@@ -26,6 +26,14 @@ When the queue is full (more than `PermitLimit` concurrent requests are waiting)
   Computed as `Math.Ceiling(IntervalInSeconds)`. Written into the `Retry-After` response header for rejected requests so clients know when the queue is likely to have capacity again.
 </ParamField>
 
+<ParamField path="ShouldThrowOnFailures" type="bool" default="false">
+  Controls how ThrottlingTroll handles internal errors (e.g., a Redis timeout while reading the counter). When `false` (the default), the error is logged and the request is allowed to proceed. When `true`, the exception is rethrown and the request fails.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="false">
+  When `false` (the default), any request that matches an entry in `ThrottlingTrollConfig.AllowList` is exempt from this rule. Set to `true` to apply the rule unconditionally, even to allowlisted identities.
+</ParamField>
+
 ## How the delay is calculated
 
 For each accepted request ThrottlingTroll performs an atomic increment to determine the request's position (`count`) in the current queue, then applies:

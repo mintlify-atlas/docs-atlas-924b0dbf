@@ -1,7 +1,7 @@
 ---
-title: "Get Started with ThrottlingTroll in ASP.NET Core"
+title: "ThrottlingTroll Quickstart: ASP.NET Core Rate Limiting"
 sidebarTitle: "ASP.NET Core"
-description: "Install ThrottlingTroll and add rate limiting to an ASP.NET Core Minimal API or MVC app in under 5 minutes."
+description: "Add rate limiting to ASP.NET Core with ThrottlingTroll. Configure rules in code, appsettings.json, or attributes to automatically return 429 responses."
 ---
 
 This guide walks you through adding rate limiting to an ASP.NET Core application using ThrottlingTroll. Whether you are building a Minimal API or a classic MVC app, you will be returning `429 TooManyRequests` to clients who exceed your configured limits within just a few minutes of setup.
@@ -93,7 +93,7 @@ using ThrottlingTroll;
 public class DataController : ControllerBase
 {
     // Limit this endpoint to 5 requests per 30 seconds
-    [ThrottlingTroll(Algorithm = RateLimitMethod.FixedWindow, PermitLimit = 5, IntervalInSeconds = 30)]
+    [ThrottlingTroll(Algorithm = RateLimitAlgorithm.FixedWindow, PermitLimit = 5, IntervalInSeconds = 30)]
     [HttpGet]
     public IActionResult Get()
     {

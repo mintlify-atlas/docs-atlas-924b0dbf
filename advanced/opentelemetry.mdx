@@ -1,7 +1,7 @@
 ---
 title: "OpenTelemetry Tracing and Metrics for ThrottlingTroll"
 sidebarTitle: "OpenTelemetry"
-description: "ThrottlingTroll emits OpenTelemetry traces and metrics. Subscribe to the ThrottlingTroll activity source and meter to integrate with Jaeger, Prometheus, or any OTel backend."
+description: "ThrottlingTroll emits OpenTelemetry traces and metrics. Subscribe to its activity source and meter to connect Jaeger, Prometheus, or any OTel backend."
 ---
 
 ThrottlingTroll is instrumented with OpenTelemetry out of the box. Every rule evaluation produces a trace span and every throttling decision increments a metric counter, giving you end-to-end production visibility with zero additional instrumentation code. All you need to do is subscribe to the `ThrottlingTroll` source in your OpenTelemetry pipeline.

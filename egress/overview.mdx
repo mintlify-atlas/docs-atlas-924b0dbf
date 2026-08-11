@@ -1,7 +1,7 @@
 ---
 title: "Egress Throttling: Rate Limit Outbound HttpClient Calls"
 sidebarTitle: "Overview"
-description: "ThrottlingTroll egress throttling wraps HttpClient as a DelegatingHandler to limit outbound calls to external APIs without making the actual network request."
+description: "ThrottlingTroll egress throttling wraps HttpClient as a DelegatingHandler to enforce rate limits on outbound API calls before any network request is made."
 ---
 
 When your service calls external APIs — payment processors, partner services, upstream data providers — it must respect their published rate limits. Violating those limits can result in bans, degraded service, or cascading failures across your system. ThrottlingTroll egress throttling lets you declare those limits in your own configuration and enforce them locally, so your `HttpClient` calls never exceed the allowed rate in the first place.

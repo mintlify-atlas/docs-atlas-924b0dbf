@@ -1,7 +1,7 @@
 ---
-title: "Use ThrottlingTroll in Any .NET Application"
+title: "ThrottlingTroll in Generic .NET: Console Apps and Workers"
 sidebarTitle: "Generic .NET"
-description: "Use ThrottlingTroll's IThrottlingTroll interface for rate limiting and circuit-breaking in console apps, workers, and any .NET code."
+description: "Apply rate limiting and circuit breaking to any .NET code via IThrottlingTroll. Works in console apps, worker services, and libraries with no web pipeline."
 ---
 
 Since v8.0, ThrottlingTroll is no longer limited to web projects. You can instantiate `ThrottlingTroll.ThrottlingTroll` directly in any .NET application — a console app, a background worker service, a class library, or a Blazor app — and wrap arbitrary blocks of code with rate limits, semaphores, or circuit breakers. There is no need for an HTTP pipeline; ThrottlingTroll operates purely in-process and can optionally connect to a distributed counter store to coordinate limits across multiple instances.
@@ -174,7 +174,7 @@ while (true)
 | `WithThrottlingTroll(todo, onLimitExceeded, methodName?)` | Same as above but for `void`-style async code (returns `Task`). |
 | `WithThrottlingTroll<T>(requestProxy, todo, onLimitExceeded)` | Advanced overload: supply your own `IHttpRequestProxy` implementation to control how ThrottlingTroll identifies and filters requests. |
 | `WithThrottlingTroll(requestProxy, todo, onLimitExceeded)` | Same as above, `void`-style. |
-| `GetCurrentConfig()` | Returns a snapshot of the active `ThrottlingTrollConfig` (all rules currently loaded). |
+| `GetCurrentConfig()` | Returns `Task<ThrottlingTrollConfig>` — an async snapshot of the active config (all rules currently loaded). |
 
 ## Using IThrottlingTroll in Worker Services with DI
 

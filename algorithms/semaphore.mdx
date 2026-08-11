@@ -1,5 +1,5 @@
 ---
-title: "Semaphore Concurrency Limiter in ThrottlingTroll"
+title: "Semaphore Concurrency Limiter in ThrottlingTroll .NET"
 sidebarTitle: "Semaphore"
 description: "SemaphoreRateLimitMethod limits the number of concurrently executing requests. With PermitLimit=1 and a distributed store, it acts as a distributed lock."
 ---
@@ -32,6 +32,10 @@ This makes Semaphore the right tool for protecting resource-intensive operations
 
 <ParamField path="RetryAfterInSeconds" type="int" readonly>
   Computed as `Math.Ceiling(TimeoutInSeconds)`. Written into the `Retry-After` response header. This is a conservative upper bound — in practice slots become available as soon as individual requests finish, which is much sooner than `TimeoutInSeconds`.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="false">
+  When `false` (the default), any request that matches an entry in `ThrottlingTrollConfig.AllowList` is exempt from this rule. Set to `true` to apply the rule unconditionally, even to allowlisted identities.
 </ParamField>
 
 ## Usage

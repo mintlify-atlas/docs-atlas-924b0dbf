@@ -1,12 +1,12 @@
 ---
-title: "Circuit Breaker Pattern in ThrottlingTroll"
+title: "Circuit Breaker Rate Limiting Algorithm in ThrottlingTroll"
 sidebarTitle: "Circuit Breaker"
-description: "CircuitBreakerRateLimitMethod tracks failure rates and trips open when PermitLimit failures occur in IntervalInSeconds, then tests recovery via a trial interval."
+description: "CircuitBreakerRateLimitMethod counts failures per IntervalInSeconds window, trips open at PermitLimit, and probes recovery via TrialIntervalInSeconds."
 ---
 
 The Circuit Breaker algorithm protects your service and its downstream dependencies from cascading failures. Instead of counting all requests, it counts only **failures** — exceptions thrown during request processing, and HTTP responses outside the `200–299` range. When the number of failures within an `IntervalInSeconds` window reaches `PermitLimit`, the circuit trips open and all subsequent requests are immediately rejected with `429 TooManyRequests`, sparing the failing downstream system from further load. Periodically, one trial request is allowed through; if it succeeds, the circuit closes and normal traffic resumes.
 
-Unlike the other ThrottlingTroll algorithms, CircuitBreaker state is tracked **per-instance** using an in-process `MemoryCacheCounterStore`. This means each replica of your service independently decides when to open and close the circuit, which is intentional — a failure visible to one instance may not yet be visible to another, and coordinating circuit state across a distributed cluster adds complexity without meaningful benefit for most failure scenarios.
+Unlike the other ThrottlingTroll algorithms, CircuitBreaker state is tracked **per process** using an in-process `MemoryCacheCounterStore`. This means each replica of your service independently decides when to open and close the circuit, which is intentional — a failure visible to one replica may not yet be visible to another, and coordinating circuit state across a distributed cluster adds complexity without meaningful benefit for most failure scenarios.
 
 ## State machine
 
@@ -42,6 +42,10 @@ The circuit moves through three states:
 
 <ParamField path="RetryAfterInSeconds" type="int" readonly>
   Computed as `Math.Ceiling(IntervalInSeconds)`. Written into the `Retry-After` response header for requests rejected while the circuit is open. This is a conservative hint; in practice the circuit may close sooner if a trial request succeeds.
+</ParamField>
+
+<ParamField path="ShouldThrowOnFailures" type="bool" default="false">
+  Controls how ThrottlingTroll handles internal errors (e.g., a counter store failure). When `false` (the default), the error is logged and the request is allowed to proceed. When `true`, the exception is rethrown and the request fails.
 </ParamField>
 
 ## Customising failure detection
@@ -168,7 +172,7 @@ public async Task<IActionResult> ChargeCard([FromBody] PaymentRequest request)
 ```
 
 <Note>
-  **Circuit breaker state is per-instance, not distributed.** Even when you configure a distributed `RedisCounterStore` for your other rules, `CircuitBreakerRateLimitMethod` always uses its own internal `MemoryCacheCounterStore`. Failure counts and circuit state are local to each running instance of your service. In a multi-instance deployment, different replicas may have their circuits in different states at the same time. This is by design: each replica independently observes failures in the requests it handles and protects itself accordingly.
+  **Circuit breaker state is per-replica, not distributed.** Even when you configure a distributed `RedisCounterStore` for your other rules, `CircuitBreakerRateLimitMethod` always uses its own internal `MemoryCacheCounterStore`. Failure counts and circuit state are local to each running process of your service. In a multi-replica deployment, different replicas may have their circuits in different states at the same time. This is by design: each replica independently observes failures in the requests it handles and protects itself accordingly.
 </Note>
 
 <Warning>

@@ -12,9 +12,9 @@ The `[ThrottlingTroll]` attribute is the most concise way to define rate limitin
   The rate limiting algorithm to apply. One of:
   - `RateLimitAlgorithm.FixedWindow` — fixed time window counter
   - `RateLimitAlgorithm.SlidingWindow` — rolling window counter divided into buckets
-  - `RateLimitAlgorithm.LeakyBucket` — queue-based smoothing with built-in delay
   - `RateLimitAlgorithm.Semaphore` — concurrent-request limiter (concurrency cap)
   - `RateLimitAlgorithm.CircuitBreaker` — failure-rate-based circuit breaker
+  - `RateLimitAlgorithm.LeakyBucket` — queue-based smoothing with built-in delay
 </ParamField>
 
 <ParamField path="PermitLimit" type="int" required>
@@ -30,7 +30,7 @@ The `[ThrottlingTroll]` attribute is the most concise way to define rate limitin
 </ParamField>
 
 <ParamField path="TrialIntervalInSeconds" type="double">
-  `CircuitBreaker` only. How frequently (in seconds) the circuit allows a single trial request through once the failure threshold has been exceeded. Defaults to `100`.
+  `CircuitBreaker` only. How frequently (in seconds) the circuit allows a single trial request through once the failure threshold has been exceeded. Must be set to a value greater than `0` when using `CircuitBreaker`.
 </ParamField>
 
 <ParamField path="TimeoutInSeconds" type="double" default="100">

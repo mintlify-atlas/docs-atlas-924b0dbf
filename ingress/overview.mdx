@@ -90,6 +90,10 @@ Every `ThrottlingTrollRule` inherits from `RequestFilter`, which defines the con
   When set alongside `IdentityIdExtractor`, the rule only applies to requests whose extracted identity equals this value. Useful for creating rules that target a specific API key or user ID.
 </ParamField>
 
+<ParamField path="IdentityIdExtractor" type="Func<IHttpRequestProxy, string>">
+  A delegate that extracts a per-client identity string from the incoming request. When set, each unique return value gets its own independent rate-limit counter. Returning `null` or an empty string falls back to the shared counter. Overrides the global `ThrottlingTrollOptions.IdentityIdExtractor` for this rule.
+</ParamField>
+
 ### Example: targeting a specific endpoint and method
 
 ```csharp

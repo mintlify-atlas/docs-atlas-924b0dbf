@@ -32,6 +32,10 @@ Programmatic configuration gives you complete control over ThrottlingTroll's beh
   A global delegate that returns the "cost" (weight) of a request, defaulting to `1`. When set, requests increment the counter by the returned cost rather than by 1. This lets you model variable-cost operations — for example, charging more for an expensive search endpoint than a simple read. Individual rules can override this with their own `CostExtractor` property.
 </ParamField>
 
+<ParamField path="Log" type="Action<LogLevel, string>">
+  A custom logging delegate. When set, ThrottlingTroll calls this action for every internal log entry — warning messages when a limit is exceeded, error messages on internal failures, and so on. When not set, ThrottlingTroll resolves an `ILogger<ThrottlingTrollCore>` from the DI container automatically. Override this only when you need to route ThrottlingTroll log output to a non-standard sink.
+</ParamField>
+
 <ParamField path="ResponseFabric" type="Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>">
   A global async delegate invoked whenever a request is rejected due to a rate limit. It receives the list of `LimitCheckResult` objects (one per matched rule), a request proxy, a response proxy to write the custom response to, and a cancellation token. Set `responseProxy.StatusCode` and call `responseProxy.WriteAsync(...)` to control the response. Per-rule `ResponseFabric` delegates (or `ResponseBody`/`ResponseStatusCode` on `[ThrottlingTroll]` attributes) take precedence over this global handler.
 </ParamField>

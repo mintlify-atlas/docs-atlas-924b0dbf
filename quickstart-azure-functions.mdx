@@ -1,7 +1,7 @@
 ---
-title: "Get Started with ThrottlingTroll in Azure Functions"
+title: "ThrottlingTroll Quickstart: Azure Functions Rate Limiting"
 sidebarTitle: "Azure Functions"
-description: "Add rate limiting to Azure Functions Isolated or InProc projects with ThrottlingTroll.AzureFunctions NuGet package."
+description: "Add rate limiting to Azure Functions Isolated and InProc projects with ThrottlingTroll.AzureFunctions. Configure via host.json, code, or attributes."
 ---
 
 This page covers adding ThrottlingTroll rate limiting to Azure Functions projects. ThrottlingTroll supports both the modern **.NET Isolated** worker model and the legacy **.NET InProc** model, as well as "classic" HTTP-triggered functions and the ASP.NET Core Integration mode available in Isolated projects.
@@ -211,7 +211,7 @@ using ThrottlingTroll;
 public class MyFunctions
 {
     [Function("MyFunc")]
-    [ThrottlingTroll(Algorithm = RateLimitMethod.FixedWindow, PermitLimit = 10, IntervalInSeconds = 60)]
+    [ThrottlingTroll(Algorithm = RateLimitAlgorithm.FixedWindow, PermitLimit = 10, IntervalInSeconds = 60)]
     public HttpResponseData MyFunc(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
     {

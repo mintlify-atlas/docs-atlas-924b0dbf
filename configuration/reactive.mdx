@@ -102,21 +102,25 @@ app.UseThrottlingTroll(options =>
 
 ## Using ThrottlingTrollConfig.FromConfigSection
 
-`ThrottlingTrollConfig.FromConfigSection` is a static helper that reads a `ThrottlingTrollConfig` directly from an `IConfiguration` section. Use it inside `GetConfigFunc` when you want ThrottlingTroll to re-read `appsettings.json` (or any other `IConfiguration` source) on each poll cycle rather than only once at startup:
+`ThrottlingTrollConfig.FromConfigSection` is a static helper that reads a `ThrottlingTrollConfig` directly from an `IConfiguration` section. Its signature is:
+
+```csharp
+public static ThrottlingTrollConfig FromConfigSection(IServiceProvider provider, string sectionName)
+```
+
+It returns a `ThrottlingTrollConfig` (not a delegate), so you call it **inside** `GetConfigFunc` to make ThrottlingTroll re-read your `appsettings.json` (or any other `IConfiguration` source) on every poll cycle rather than only once at startup:
 
 ```csharp
 app.UseThrottlingTroll(options =>
 {
-    options.GetConfigFunc = ThrottlingTrollConfig.FromConfigSection(
-        app.Services,
-        "ThrottlingTrollIngress"
-    ).AsAsyncFunc();
+    options.GetConfigFunc = async () =>
+        ThrottlingTrollConfig.FromConfigSection(app.Services, "ThrottlingTrollIngress");
 
     options.IntervalToReloadConfigInSeconds = 30;
 });
 ```
 
-Alternatively, if you need to compose the config manually before returning it:
+If you need to augment the file-based config with additional programmatic rules before returning it:
 
 ```csharp
 app.UseThrottlingTroll(options =>
