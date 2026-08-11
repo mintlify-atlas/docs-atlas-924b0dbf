@@ -1,0 +1,128 @@
+---
+title: "Semaphore Concurrency Limiter in ThrottlingTroll"
+sidebarTitle: "Semaphore"
+description: "SemaphoreRateLimitMethod limits the number of concurrently executing requests. With PermitLimit=1 and a distributed store, it acts as a distributed lock."
+---
+
+The Semaphore algorithm is a **concurrency limiter** rather than a rate limiter. Where Fixed Window, Sliding Window, and Leaky Bucket all measure requests per unit of time, Semaphore measures requests in flight at any given instant. When a request arrives, ThrottlingTroll atomically increments a counter; when the request completes (successfully or not), ThrottlingTroll decrements it. If the counter would exceed `PermitLimit`, the request is rejected with `429 TooManyRequests` before any business logic runs.
+
+This makes Semaphore the right tool for protecting resource-intensive operations — database migrations, report generation, file processing — where the risk is not too many requests per minute but too many requests *simultaneously* exhausting memory, CPU, or connection pool slots. When backed by a distributed counter store such as Redis, Semaphore enforces the limit across all instances of your service. Set `PermitLimit = 1` and you have a distributed lock.
+
+## Class
+
+`SemaphoreRateLimitMethod`
+
+## Properties
+
+<ParamField path="PermitLimit" type="int" required>
+  The maximum number of requests allowed to execute concurrently. Once this many requests are in flight, any additional request receives `429 TooManyRequests` immediately. The counter is decremented when each request completes, freeing a slot for the next caller.
+</ParamField>
+
+<ParamField path="TimeoutInSeconds" type="double" default="100">
+  The TTL of the concurrency counter, in seconds. If a request starts but never completes (e.g., the process crashes mid-flight), the counter would otherwise be leaked and permanently block a slot. ThrottlingTroll sets the counter's absolute expiry to `now + TimeoutInSeconds` so orphaned increments eventually expire. Set this to a value comfortably longer than your worst-case request duration.
+</ParamField>
+
+<ParamField path="ReleaseAfterSeconds" type="double" default="0">
+  When greater than `0`, the semaphore slot is not released immediately when the request completes — it is held for an additional `ReleaseAfterSeconds` before being decremented. This is used to implement **request deduplication**: if the same logical request arrives again within the hold window, it is rejected as a duplicate. See the [request deduplication guide](/ingress/request-deduplication) for a full walkthrough.
+</ParamField>
+
+<ParamField path="ShouldThrowOnFailures" type="bool" default="true">
+  Unlike other algorithms where this defaults to `false`, Semaphore defaults to `true`. If a decrement fails (e.g., a Redis error at request completion), the slot would remain permanently consumed and `PermitLimit` would effectively shrink by one on every such failure. Throwing on failures signals the problem immediately rather than silently degrading capacity.
+</ParamField>
+
+<ParamField path="RetryAfterInSeconds" type="int" readonly>
+  Computed as `Math.Ceiling(TimeoutInSeconds)`. Written into the `Retry-After` response header. This is a conservative upper bound — in practice slots become available as soon as individual requests finish, which is much sooner than `TimeoutInSeconds`.
+</ParamField>
+
+## Usage
+
+### Limiting concurrent execution
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/heavy-operation",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 10,
+                    TimeoutInSeconds = 30
+                }
+            }
+        ]
+    };
+});
+```
+
+### Distributed lock (PermitLimit = 1 with Redis)
+
+When `PermitLimit` is set to `1` and ThrottlingTroll is configured with a `RedisCounterStore`, each rule acts as a distributed lock. Adding an `IdentityIdExtractor` that returns a resource identifier turns this into a collection of named distributed locks — one per unique identity value.
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/process-order",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 1,
+                    TimeoutInSeconds = 60
+                },
+                IdentityIdExtractor = request =>
+                    request.Query.TryGetValue("orderId", out var id) ? id : "global"
+            }
+        ]
+    };
+});
+```
+
+### Attribute (declarative) configuration
+
+```csharp
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.Semaphore,
+    PermitLimit = 5,
+    TimeoutInSeconds = 30)]
+public async Task<IActionResult> GenerateReport([FromQuery] string reportId)
+{
+    var result = await _reportService.GenerateAsync(reportId);
+    return Ok(result);
+}
+```
+
+### appsettings.json configuration
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/heavy-operation",
+        "RateLimit": {
+          "Algorithm": "Semaphore",
+          "PermitLimit": 10,
+          "TimeoutInSeconds": 30
+        }
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  **`ShouldThrowOnFailures` defaults to `true` for Semaphore.** A failed decrement (e.g., a transient Redis error at request completion) would permanently consume a concurrency slot. Over time, repeated failures would silently drain all available slots until nothing can execute. By throwing on failures, the problem surfaces immediately and can be acted upon rather than accumulating invisibly.
+</Note>
+
+<Tip>
+  **Distributed locks with named identities.** Set `PermitLimit = 1`, configure a `RedisCounterStore`, and add an `IdentityIdExtractor` that returns the ID of the resource being modified (an order ID, a document ID, a user ID). ThrottlingTroll will then enforce mutual exclusion per resource — no two requests modifying the same resource will execute concurrently, while requests for different resources proceed in parallel. See the [request deduplication guide](/ingress/request-deduplication) for the `ReleaseAfterSeconds` deduplication pattern.
+</Tip>

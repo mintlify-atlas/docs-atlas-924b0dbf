@@ -1,0 +1,205 @@
+---
+title: "Ingress Throttling: Protect Your APIs from Overload"
+sidebarTitle: "Overview"
+description: "ThrottlingTroll ingress throttling automatically returns 429 TooManyRequests when clients exceed configured rate limits in ASP.NET Core and Azure Functions."
+---
+
+Ingress throttling is the protective layer that sits in front of your API endpoints and enforces rate limits on every incoming request. When a client sends too many requests within a configured time window, ThrottlingTroll automatically responds with `429 Too Many Requests` — no changes to your endpoint code required. It operates as standard ASP.NET Core middleware (or Azure Functions middleware), wrapping each request as it passes through the pipeline.
+
+## How it works
+
+ThrottlingTroll intercepts every incoming HTTP request, evaluates it against all configured rules, increments the relevant counters, and either passes the request through to your handler or short-circuits with a `429` response. The whole process is transparent to your controllers and minimal API handlers.
+
+```
+Client Request
+      │
+      ▼
+┌─────────────────────────────┐
+│  ThrottlingTroll Middleware  │
+│                             │
+│  1. Match request to rules  │
+│  2. Check + increment       │
+│     counter(s)              │
+│  3a. Limit OK → pass to     │
+│      next middleware        │
+│  3b. Limit exceeded →       │
+│      return 429 + Retry-After│
+└─────────────────────────────┘
+      │                  │
+      ▼                  ▼
+ Your handler      429 Response
+```
+
+Register the middleware in `Program.cs` (or `Startup.cs`) with a single call:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 100,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+```
+
+---
+
+## Targeting requests with RequestFilter
+
+Every `ThrottlingTrollRule` inherits from `RequestFilter`, which defines the conditions a request must satisfy for a rule to apply. All conditions are combined with AND logic — a request must match every specified filter field. Unset fields match any request.
+
+<ParamField path="UriString" type="string">
+  A substring that must appear anywhere in the request URI. Case-insensitive. Empty or `null` matches any URI.
+</ParamField>
+
+<ParamField path="UriPattern" type="string">
+  A regular-expression pattern matched against the full request URI (including query string). When set, this **overrides** `UriString`. Compiled with `IgnoreCase`. Empty or `null` matches any URI.
+
+  You can also embed a named capture group `(?<ThrottlingTrollIdentityId>...)` directly in the pattern to extract a per-client identity from the URL — see [Identity & Cost](/ingress/identity-and-cost).
+</ParamField>
+
+<ParamField path="Method" type="string">
+  Comma-separated list of HTTP methods the rule applies to, e.g. `"GET,POST"`. Empty or `null` matches any method. Comparison is case-insensitive.
+</ParamField>
+
+<ParamField path="HeaderName" type="string">
+  Name of an HTTP request header to inspect. When set, the rule only matches requests that include this header. If `HeaderValue` and `HeaderValuePattern` are both unset, the rule matches any non-empty value.
+</ParamField>
+
+<ParamField path="HeaderValue" type="string">
+  Exact value that the header identified by `HeaderName` must equal. Ignored when `HeaderValuePattern` is also set.
+</ParamField>
+
+<ParamField path="HeaderValuePattern" type="string">
+  A regex pattern matched against the value of the header identified by `HeaderName`. **Overrides** `HeaderValue` when both are set.
+
+  Like `UriPattern`, this field also supports the `(?<ThrottlingTrollIdentityId>...)` named group for identity extraction.
+</ParamField>
+
+<ParamField path="IdentityId" type="string">
+  When set alongside `IdentityIdExtractor`, the rule only applies to requests whose extracted identity equals this value. Useful for creating rules that target a specific API key or user ID.
+</ParamField>
+
+### Example: targeting a specific endpoint and method
+
+```csharp
+new ThrottlingTrollRule
+{
+    UriPattern = "/api/orders",
+    Method = "POST",
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 50,
+        IntervalInSeconds = 60
+    }
+}
+```
+
+This rule enforces a maximum of 50 `POST` requests to any URI matching `/api/orders` per 60-second window. `GET /api/orders` is unaffected.
+
+---
+
+## AllowList — exempting requests from all rules
+
+`ThrottlingTrollConfig.AllowList` is a list of `RequestFilter` objects. Any request that matches **any** entry in the allow-list is entirely exempt from all throttling rules. This is the right place for health-check probes, internal monitoring endpoints, or privileged service accounts.
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        AllowList =
+        [
+            // Health checks are never throttled
+            new RequestFilter { UriPattern = "^.*/health$" },
+
+            // Internal monitoring header bypasses all limits
+            new RequestFilter
+            {
+                HeaderName = "X-Internal-Monitor",
+                HeaderValue = "true"
+            }
+        ],
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 500,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+```
+
+<Note>
+  Individual rules can opt out of the allow-list check by setting `IgnoreAllowList = true` on the `ThrottlingTrollAttribute`. This is useful for security-critical rules that must apply unconditionally, regardless of allow-list entries.
+</Note>
+
+---
+
+## Default throttled response
+
+When a limit is exceeded and no custom `ResponseFabric` is configured, ThrottlingTroll:
+
+1. Sets the response status code to **`429 Too Many Requests`**.
+2. Adds a `Retry-After` header with the number of **seconds** the client should wait before retrying.
+3. Writes a plain-text body of the form `Retry after {N} seconds`.
+
+Clients should inspect the `Retry-After` header to implement back-off logic.
+
+---
+
+## Inspecting throttle results at runtime
+
+Two `HttpContext` extension methods let your middleware or endpoints observe what ThrottlingTroll decided for the current request:
+
+```csharp
+// Returns all active ThrottlingTrollConfig objects (merged from all config sources)
+List<ThrottlingTrollConfig> config = HttpContext.GetThrottlingTrollConfig();
+
+// Returns the limit-check result for every rule that matched the current request.
+// RequestsRemaining < 0 means that rule was exceeded.
+// Returns null if ThrottlingTroll experienced an internal failure.
+List<LimitCheckResult> results = HttpContext.GetThrottlingTrollLimitCheckResults();
+```
+
+Each `LimitCheckResult` exposes:
+
+| Property | Type | Description |
+|---|---|---|
+| `RequestsRemaining` | `int` | Remaining quota. Negative when the limit is exceeded. |
+| `RetryAfterInSeconds` | `int` | Suggested seconds to wait before retrying. |
+| `RetryAfterHeaderValue` | `string` | Ready-to-use `Retry-After` header value. |
+| `CounterId` | `string` | Unique hash identifying the counter (rule + optional identity). |
+| `Rule` | `ThrottlingTrollRule` | Reference to the matched rule. |
+
+<Note>
+  All rules that **match** the current request are evaluated — not just the first one. When multiple rules are exceeded, the one with the **highest `RetryAfterInSeconds`** value determines the response sent to the client. Use this behaviour intentionally: you can stack a global rate limit on top of a per-client rate limit, and the stricter constraint always wins.
+</Note>
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Identity & Cost" icon="fingerprint" href="/ingress/identity-and-cost">
+    Rate-limit individual clients by IP, API key, JWT claim, or custom logic. Assign weighted costs to expensive operations.
+  </Card>
+  <Card title="Delays & Responses" icon="clock" href="/ingress/delays-and-responses">
+    Delay requests until a slot opens, queue them in a spin-wait loop, or return fully custom HTTP responses.
+  </Card>
+</CardGroup>

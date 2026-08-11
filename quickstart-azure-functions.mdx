@@ -1,0 +1,230 @@
+---
+title: "Get Started with ThrottlingTroll in Azure Functions"
+sidebarTitle: "Azure Functions"
+description: "Add rate limiting to Azure Functions Isolated or InProc projects with ThrottlingTroll.AzureFunctions NuGet package."
+---
+
+This page covers adding ThrottlingTroll rate limiting to Azure Functions projects. ThrottlingTroll supports both the modern **.NET Isolated** worker model and the legacy **.NET InProc** model, as well as "classic" HTTP-triggered functions and the ASP.NET Core Integration mode available in Isolated projects.
+
+<Tabs>
+  <Tab title="Isolated (.NET)">
+
+    The Isolated worker model is the recommended approach for new Azure Functions projects. ThrottlingTroll integrates as a standard Functions middleware.
+
+    <Steps>
+
+      <Step title="Install the NuGet package">
+        ```bash
+        dotnet add package ThrottlingTroll.AzureFunctions
+        ```
+      </Step>
+
+      <Step title="Register the middleware">
+        Call `workerAppBuilder.UseThrottlingTroll()` inside your `ConfigureFunctionsWebApplication` (or `ConfigureFunctionsWorkerDefaults`) block in `Program.cs`:
+
+        ```csharp
+        using ThrottlingTroll;
+
+        var builder = new HostBuilder();
+
+        builder.ConfigureFunctionsWebApplication((builderContext, workerAppBuilder) =>
+        {
+            workerAppBuilder.UseThrottlingTroll();
+        });
+
+        builder.Build().Run();
+        ```
+
+        With no options, ThrottlingTroll reads rules from the `ThrottlingTrollIngress` section of `host.json`.
+      </Step>
+
+      <Step title="Configure a rule">
+        Pass an options delegate to `UseThrottlingTroll` to configure rules programmatically. The following example limits all HTTP-triggered functions to **20 requests per 60 seconds**:
+
+        ```csharp
+        using ThrottlingTroll;
+
+        var builder = new HostBuilder();
+
+        builder.ConfigureFunctionsWebApplication((builderContext, workerAppBuilder) =>
+        {
+            workerAppBuilder.UseThrottlingTroll(options =>
+            {
+                options.Config = new ThrottlingTrollConfig
+                {
+                    Rules =
+                    [
+                        new ThrottlingTrollRule
+                        {
+                            LimitMethod = new FixedWindowRateLimitMethod
+                            {
+                                PermitLimit = 20,
+                                IntervalInSeconds = 60
+                            }
+                        }
+                    ]
+                };
+            });
+        });
+
+        builder.Build().Run();
+        ```
+
+        Alternatively, define limits in `host.json` under `ThrottlingTrollIngress`:
+
+        ```json
+        {
+          "version": "2.0",
+          "ThrottlingTrollIngress": {
+            "Rules": [
+              {
+                "UriPattern": "/api/MyFunction",
+                "LimitMethod": {
+                  "Type": "FixedWindow",
+                  "PermitLimit": 20,
+                  "IntervalInSeconds": 60
+                }
+              }
+            ]
+          }
+        }
+        ```
+      </Step>
+
+      <Step title="Test the limit">
+        Deploy or run the Functions app locally with `func start`. Send more than 20 requests to a matching HTTP trigger within 60 seconds. Requests that exceed the limit receive:
+
+        - **HTTP 429 TooManyRequests**
+        - A `Retry-After` header indicating the wait time in seconds
+
+        Requests within the limit pass through normally.
+      </Step>
+
+    </Steps>
+
+    <Note>
+      When using the **ASP.NET Core Integration** mode (i.e., `ConfigureFunctionsWebApplication` instead of `ConfigureFunctionsWorkerDefaults`), ThrottlingTroll works identically — `UseThrottlingTroll()` is registered on the same `IFunctionsWorkerApplicationBuilder`, and the ASP.NET Core request pipeline is used under the hood.
+    </Note>
+
+  </Tab>
+  <Tab title="InProc (.NET)">
+
+    The InProc model runs your functions inside the Azure Functions host process. ThrottlingTroll integrates via the `IWebJobsStartup` extension point and the `IThrottlingTroll` interface.
+
+    <Steps>
+
+      <Step title="Install the NuGet package">
+        ```bash
+        dotnet add package ThrottlingTroll.AzureFunctions
+        ```
+      </Step>
+
+      <Step title="Register ThrottlingTroll at startup">
+        Create a startup class that implements `IWebJobsStartup` and call `builder.Services.AddThrottlingTroll()`. Because InProc Functions load configuration from `host.json`, the section names are prefixed with `AzureFunctionsJobHost:`.
+
+        ```csharp
+        using Microsoft.Azure.WebJobs;
+        using Microsoft.Azure.WebJobs.Hosting;
+        using ThrottlingTroll;
+
+        [assembly: WebJobsStartup(typeof(MyFunctionApp.Startup))]
+
+        namespace MyFunctionApp
+        {
+            public class Startup : IWebJobsStartup
+            {
+                public void Configure(IWebJobsBuilder builder)
+                {
+                    builder.Services.AddThrottlingTroll(options =>
+                    {
+                        // In InProc Functions, host.json sections are prefixed with "AzureFunctionsJobHost:"
+                        options.ConfigSectionName = "AzureFunctionsJobHost:ThrottlingTrollIngress";
+                    });
+                }
+            }
+        }
+        ```
+
+        You can also pass a `ThrottlingTrollConfig` directly in the options delegate to configure rules programmatically instead of (or in addition to) reading from `host.json`.
+      </Step>
+
+      <Step title="Add the InProcHttpRequestProxy">
+        InProc Functions use a different HTTP abstraction than Isolated, so ThrottlingTroll needs a thin adapter. Add the `InProcHttpRequestProxy` class to your project — a reference implementation is available in the [ThrottlingTroll-AzureFunctions-Samples](https://github.com/ThrottlingTroll/ThrottlingTroll-AzureFunctions-Samples) repository. The proxy wraps an `HttpRequest` from `Microsoft.AspNetCore.Http` and exposes the `IHttpRequestProxy` interface that ThrottlingTroll expects.
+      </Step>
+
+      <Step title="Wrap your function with WithThrottlingTroll">
+        Inject `IThrottlingTroll` into your function class and wrap each HTTP-triggered function body with `this._thtr.WithThrottlingTroll(...)`. Provide a `todo` delegate for the normal execution path and an `onLimitExceeded` delegate for the throttled response:
+
+        ```csharp
+        using System.Net;
+        using System.Threading.Tasks;
+        using Microsoft.AspNetCore.Http;
+        using Microsoft.AspNetCore.Mvc;
+        using Microsoft.Azure.WebJobs;
+        using Microsoft.Azure.WebJobs.Extensions.Http;
+        using ThrottlingTroll;
+
+        public class MyFunctions
+        {
+            private readonly IThrottlingTroll _thtr;
+
+            public MyFunctions(IThrottlingTroll thtr)
+            {
+                this._thtr = thtr;
+            }
+
+            [FunctionName("MyFunc")]
+            public Task<IActionResult> MyFunc(
+                [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequest req)
+                => this._thtr.WithThrottlingTroll(
+                    new InProcHttpRequestProxy(req),
+                    async ctx =>
+                    {
+                        // Normal execution path
+                        return (IActionResult)new OkObjectResult("OK");
+                    },
+                    async ctx =>
+                    {
+                        // Called when the rate limit is exceeded
+                        return (IActionResult)new StatusCodeResult((int)HttpStatusCode.TooManyRequests);
+                    });
+        }
+        ```
+
+        The `ThrottlingTrollContext` passed to `onLimitExceeded` contains `ExceededLimit` with the rule name, the retry-after interval, and other details you can use to build a rich error response.
+      </Step>
+
+    </Steps>
+
+  </Tab>
+</Tabs>
+
+## Declarative Configuration with Attributes
+
+In Isolated Functions, you can also apply the `[ThrottlingTroll]` attribute directly to a function method, and ThrottlingTroll will register the rule automatically at startup:
+
+```csharp
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using ThrottlingTroll;
+
+public class MyFunctions
+{
+    [Function("MyFunc")]
+    [ThrottlingTroll(Algorithm = RateLimitMethod.FixedWindow, PermitLimit = 10, IntervalInSeconds = 60)]
+    public HttpResponseData MyFunc(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
+    {
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        response.WriteString("OK");
+        return response;
+    }
+}
+```
+
+## Next Steps
+
+- [Counter Stores overview](/counter-stores/overview) — Distribute rate counters across all function instances with Redis or Azure Table Storage
+- [Personalized rate limiting](/ingress/identity-and-cost) — Apply per-client limits based on headers, query strings, or claims
+- [Custom responses and delays](/ingress/delays-and-responses) — Return structured JSON error bodies or retry-after responses
+- [Sample projects](https://github.com/ThrottlingTroll/ThrottlingTroll-AzureFunctions-Samples) — Full InProc and Isolated sample repos on GitHub

@@ -1,0 +1,125 @@
+---
+title: "Request Deduplication with ThrottlingTroll Semaphore"
+sidebarTitle: "Deduplication"
+description: "Use ThrottlingTroll's Semaphore with ReleaseAfterSeconds to allow only one request with a given ID per time window — a lightweight exactly-once processing guard."
+---
+
+In distributed systems it is common for clients to retry requests — a network glitch during checkout, a mobile app sending a payment twice, a webhook provider delivering the same event more than once. Without protection, your service processes each duplicate as if it were a new request. ThrottlingTroll's `SemaphoreRateLimitMethod` with `ReleaseAfterSeconds` provides a lightweight, configuration-driven guard against this: once a request with a given identity is accepted, identical requests within the deduplication window are rejected with `429 Too Many Requests`.
+
+---
+
+## How it works
+
+The mechanism combines three features:
+
+1. **`SemaphoreRateLimitMethod` with `PermitLimit = 1`** — only one request with a given identity may be "in flight" at a time.
+2. **`ReleaseAfterSeconds`** — the semaphore counter is decremented not immediately after the request finishes, but after this many seconds. This keeps the slot occupied for the full deduplication window regardless of how fast the handler runs.
+3. **`IdentityIdExtractor`** — ties the semaphore to a client-supplied idempotency key (or order ID, transaction ID, etc.) so each unique key gets its own independent slot.
+
+A second request carrying the same idempotency key within the `ReleaseAfterSeconds` window hits the semaphore at capacity and receives `429`.
+
+---
+
+## Example: idempotent checkout
+
+```csharp
+new ThrottlingTrollRule
+{
+    UriPattern = "/api/checkout",
+    Method = "POST",
+    LimitMethod = new SemaphoreRateLimitMethod
+    {
+        PermitLimit = 1,
+        TimeoutInSeconds = 60,      // Counter TTL — how long the key is held in the store
+        ReleaseAfterSeconds = 5     // Block duplicate requests for 5 seconds after first accepted
+    },
+    IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("Idempotency-Key", out var key) ? key.ToString() : string.Empty
+}
+```
+
+With this rule:
+- `POST /api/checkout` with `Idempotency-Key: order-xyz` is accepted and processed.
+- Any subsequent `POST /api/checkout` with the **same** `Idempotency-Key` within 5 seconds receives `429 Too Many Requests`.
+- After 5 seconds the slot is released and the same key can be used again.
+
+---
+
+## appsettings.json equivalent
+
+Rules that do not require delegate-based extractors can be expressed entirely in `appsettings.json`. The `IdentityIdExtractor` must be wired in code, but the rate limit parameters live in configuration:
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/checkout",
+        "Method": "POST",
+        "RateLimit": {
+          "Algorithm": "Semaphore",
+          "PermitLimit": 1,
+          "TimeoutInSeconds": 60,
+          "ReleaseAfterSeconds": 5
+        }
+      }
+    ]
+  }
+}
+```
+
+Then register the middleware and attach the extractor programmatically:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    // Rules are loaded from appsettings.json automatically.
+    // Attach the extractor at startup so the Semaphore is keyed per idempotency token.
+    options.IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("Idempotency-Key", out var key) ? key.ToString() : string.Empty;
+});
+```
+
+---
+
+## Deduplication vs. concurrency limiting
+
+`SemaphoreRateLimitMethod` serves two related but distinct purposes depending on how it is configured:
+
+| Scenario | `PermitLimit` | `ReleaseAfterSeconds` | `IdentityIdExtractor` | Effect |
+|---|---|---|---|---|
+| **Request deduplication** | 1 | > 0 | Set (e.g. Idempotency-Key) | Each unique key is processed exactly once per window |
+| **Concurrency limiting** | N | 0 (or unset) | Optional | At most N requests execute simultaneously across all callers |
+| **Named distributed locks** | 1 | 0 (or unset) | Set | Only one concurrent execution per identity |
+
+<Warning>
+  If you omit `IdentityIdExtractor`, all requests to the matching URI share **one** semaphore slot. With `PermitLimit = 1` this means only one request can execute at a time globally for that endpoint — which is concurrency limiting, not deduplication. Always pair `ReleaseAfterSeconds` with an `IdentityIdExtractor` when your goal is idempotency.
+</Warning>
+
+---
+
+## Distributed deduplication
+
+When your service runs on multiple instances, in-memory counters are per-instance and cannot coordinate across the cluster. A request hitting instance A and its duplicate hitting instance B will both be accepted.
+
+<Note>
+  For distributed deduplication across multiple service instances, configure a distributed counter store. Redis is the recommended choice for low-latency atomic increments:
+
+  ```csharp
+  builder.Services.AddStackExchangeRedisCache(o => o.Configuration = "your-redis-connection-string");
+
+  app.UseThrottlingTroll(options =>
+  {
+      options.CounterStore = new RedisCounterStore(/* connection */);
+      // ... rules
+  });
+  ```
+
+  With a shared Redis counter, only the first request across the entire cluster — regardless of which instance it hits — will be accepted for a given idempotency key within the deduplication window.
+</Note>
+
+---
+
+## Further reading
+
+For the full `SemaphoreRateLimitMethod` reference — including concurrency limiting, distributed locks, and all configuration parameters — see [Semaphore Algorithm](/algorithms/semaphore).

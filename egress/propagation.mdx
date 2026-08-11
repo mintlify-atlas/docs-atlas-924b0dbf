@@ -1,0 +1,136 @@
+---
+title: "Propagate 429 Responses from Egress to Ingress"
+sidebarTitle: "Propagation"
+description: "Configure ThrottlingTroll to automatically propagate 429 TooManyRequests from outbound HttpClient calls back to the original ingress caller."
+---
+
+When your service acts as a proxy or aggregator, it calls downstream APIs on behalf of its own clients. If one of those downstream APIs returns `429 TooManyRequests`, your service can automatically surface that limit to its own callers instead of swallowing the error or returning a generic 5xx. This is egress-to-ingress propagation: the 429 travels up the call chain, giving the original client the same `Retry-After` signal the downstream API sent to you.
+
+## The Propagation Flow
+
+```
+Client ──► YourService ──► ExternalAPI
+                               │
+                   ❌ 429 TooManyRequests
+                               │
+           ThrottlingTrollHandler throws
+           ThrottlingTrollTooManyRequestsException
+                               │
+           ThrottlingTroll ingress middleware catches it
+                               │
+Client ◄──────── ❌ 429 TooManyRequests (with Retry-After)
+```
+
+1. A client calls your service.
+2. Your service calls an external API via an `HttpClient` configured with `ThrottlingTrollHandler`.
+3. The external API responds with `429 TooManyRequests`.
+4. `ThrottlingTrollHandler` detects the upstream 429 and, because `PropagateToIngress = true`, throws a `ThrottlingTrollTooManyRequestsException` internally.
+5. The ThrottlingTroll ingress middleware catches that exception and returns `429` to the original client, forwarding the same `Retry-After` header value.
+
+## Enabling Propagation
+
+Set `PropagateToIngress = true` on `ThrottlingTrollEgressConfig`:
+
+```csharp
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            PropagateToIngress = true,
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.partner.com",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 100,
+                        IntervalInSeconds = 60
+                    }
+                }
+            ]
+        };
+    });
+```
+
+When the upstream returns `429`, `ThrottlingTrollHandler` throws `ThrottlingTrollTooManyRequestsException` with `RetryAfterHeaderValue` set to the value of the upstream `Retry-After` response header. The ingress middleware intercepts this and adds the same `Retry-After` header to the response it sends to your caller.
+
+<Note>
+Propagation requires **both** ingress and egress ThrottlingTroll middleware to be active. The egress handler throws the exception; the ingress middleware catches it. If the ingress middleware is not registered, the exception will propagate unhandled.
+</Note>
+
+<Note>
+The `Retry-After` value forwarded to the client comes directly from the upstream 429 response. ThrottlingTroll does not modify or reinterpret it — whatever the external API told you, your caller receives.
+</Note>
+
+## How the Propagated Result Is Represented
+
+Internally, when the ingress middleware catches the propagated exception, it wraps it in a `LimitCheckResult` constructed with the `string retryAfter` overload:
+
+```csharp
+// This constructor is used for egress-to-ingress-propagated results
+public LimitCheckResult(string retryAfter)
+{
+    this.RetryAfterHeaderValue = retryAfter;
+    this.RequestsRemaining = -1;
+}
+```
+
+Unlike results from locally-evaluated rules, propagated `LimitCheckResult` instances have `CounterId` and `Rule` set to `null`. This is expected — there is no local counter involved. If you supply a custom ingress `ResponseFabric`, check for null `Rule` to distinguish propagated results from locally-enforced ones.
+
+## Complete Example: Ingress + Egress with Propagation
+
+The following example shows the full dual configuration. Ingress throttling protects your service from over-use by clients, while egress throttling enforces the external API's rate limit and propagates any upstream 429 back to the caller:
+
+```csharp
+// Ingress throttling — protect your own service
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 500,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+
+// Egress throttling with propagation — respect upstream limits and propagate 429 upstream
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            PropagateToIngress = true,
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.partner.com",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 100,
+                        IntervalInSeconds = 60
+                    }
+                }
+            ]
+        };
+    });
+```
+
+In this setup:
+- Requests arriving at your service above 500/minute are rejected immediately at ingress.
+- Outbound calls to `api.partner.com` are capped locally at 100/minute.
+- If `api.partner.com` returns `429` despite that local cap (e.g. because multiple instances share the same upstream quota), the 429 propagates back to whoever called your service.
+
+<Tip>
+Combine `PropagateToIngress = true` with a `ResponseFabric` that sets `ShouldRetry = true` only for a bounded number of attempts. This way ThrottlingTroll tries a few times to recover from an upstream 429 before propagating it, giving transient upstream throttling a chance to resolve without impacting your callers.
+</Tip>

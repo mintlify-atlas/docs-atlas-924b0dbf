@@ -1,0 +1,220 @@
+---
+title: "Programmatic ThrottlingTroll Configuration at Startup"
+sidebarTitle: "Programmatic"
+description: "Configure ThrottlingTroll rules in code at application startup using ThrottlingTrollOptions for full control over rules, identity extractors, and response fabrics."
+---
+
+Programmatic configuration gives you complete control over ThrottlingTroll's behaviour at application startup. You pass an `Action<ThrottlingTrollOptions>` delegate to `UseThrottlingTroll` (or `AddThrottlingTroll` for generic .NET hosts) and populate the options object with rules, a counter store implementation, per-request identity extraction logic, custom response handling, and more. All values are strongly typed, making this approach ideal when rules depend on environment variables, secrets, or any other runtime values that cannot be expressed in a configuration file.
+
+## ThrottlingTrollOptions properties
+
+<ParamField path="Config" type="ThrottlingTrollConfig">
+  A static `ThrottlingTrollConfig` instance containing the rules to enforce. Use this when all rules are known at startup and will not change. `Config` is merged with any rules discovered through `[ThrottlingTroll]` attributes and through `appsettings.json`.
+</ParamField>
+
+<ParamField path="GetConfigFunc" type="Func<Task<ThrottlingTrollConfig>>">
+  An async delegate that returns a `ThrottlingTrollConfig`. Use this instead of (or in addition to) `Config` when you need to load rules from an external source such as a database or a remote configuration service. When `IntervalToReloadConfigInSeconds` is also set, this delegate is called repeatedly on a background timer, enabling hot-reload. See [Reactive Configuration](/configuration/reactive) for details.
+</ParamField>
+
+<ParamField path="IntervalToReloadConfigInSeconds" type="int" default="0">
+  When greater than `0`, `GetConfigFunc` is called on a background timer with this interval (in seconds) and the resulting rules replace the previous set atomically. When `0`, `GetConfigFunc` is called exactly once at startup.
+</ParamField>
+
+<ParamField path="CounterStore" type="ICounterStore">
+  The distributed counter store implementation. Defaults to `MemoryCacheCounterStore` (in-process memory), which is suitable for single-instance deployments. For distributed deployments use one of the provided implementations: `RedisCounterStore`, `DistributedCacheCounterStore`, `AzureTableCounterStore`, or `EfCoreCounterStore`. You can also register an `ICounterStore` in the DI container and ThrottlingTroll will resolve it automatically.
+</ParamField>
+
+<ParamField path="IdentityIdExtractor" type="Func<IHttpRequestProxy, string>">
+  A global delegate that extracts a per-request identity string (e.g., a client ID, API key, or authenticated user ID) from the incoming request. The extracted value is used as part of the counter cache key so that each identity gets its own independent counter. Individual rules can override this with their own `IdentityIdExtractor` property.
+</ParamField>
+
+<ParamField path="CostExtractor" type="Func<IHttpRequestProxy, long>">
+  A global delegate that returns the "cost" (weight) of a request, defaulting to `1`. When set, requests increment the counter by the returned cost rather than by 1. This lets you model variable-cost operations — for example, charging more for an expensive search endpoint than a simple read. Individual rules can override this with their own `CostExtractor` property.
+</ParamField>
+
+<ParamField path="ResponseFabric" type="Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>">
+  A global async delegate invoked whenever a request is rejected due to a rate limit. It receives the list of `LimitCheckResult` objects (one per matched rule), a request proxy, a response proxy to write the custom response to, and a cancellation token. Set `responseProxy.StatusCode` and call `responseProxy.WriteAsync(...)` to control the response. Per-rule `ResponseFabric` delegates (or `ResponseBody`/`ResponseStatusCode` on `[ThrottlingTroll]` attributes) take precedence over this global handler.
+</ParamField>
+
+<ParamField path="Assemblies" type="List<Assembly>">
+  The list of assemblies scanned for `[ThrottlingTroll]` attributes. By default this contains the calling assembly (the project that calls `UseThrottlingTroll`). Add entries for any class libraries that contain controllers, minimal-API handlers, or Razor Pages you also want to cover declaratively. Pass an empty list to disable attribute scanning entirely.
+</ParamField>
+
+<ParamField path="ConfigSectionName" type="string" default="ThrottlingTrollIngress">
+  The `IConfiguration` section name from which static rules are loaded. Defaults to `"ThrottlingTrollIngress"` for ingress and `"ThrottlingTrollEgress"` for egress middleware. Override this if your application uses a different configuration key or if you need to load rules from a custom section.
+</ParamField>
+
+## Full startup example
+
+```csharp
+using ThrottlingTroll;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/",
+                LimitMethod = new SlidingWindowRateLimitMethod
+                {
+                    PermitLimit = 100,
+                    IntervalInSeconds = 60,
+                    NumOfBuckets = 6
+                },
+                // Per-rule identity extractor — keyed on API key header
+                IdentityIdExtractor = request =>
+                    request.Headers.TryGetValue("X-Api-Key", out var key) ? key : "anonymous"
+            },
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/reports",
+                Method = "POST",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 3,
+                    TimeoutInSeconds = 30
+                }
+            }
+        ]
+    };
+
+    // Custom 429 response for all rate-limited requests
+    options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+    {
+        var retryAfter = checkResults.Max(r => r.RetryAfterInSeconds);
+        responseProxy.StatusCode = 429;
+        responseProxy.SetHttpHeader("Retry-After", retryAfter.ToString());
+        await responseProxy.WriteAsync($"Rate limit exceeded. Retry after {retryAfter} seconds.");
+    };
+});
+
+app.Run();
+```
+
+## ThrottlingTrollRule properties
+
+`ThrottlingTrollRule` extends `RequestFilter` and adds rate limiting behaviour on top of its filter fields.
+
+### Rate limiting fields
+
+<ParamField path="LimitMethod" type="RateLimitMethod" required>
+  The rate limiting algorithm instance to apply. Set this to a concrete subclass: `FixedWindowRateLimitMethod`, `SlidingWindowRateLimitMethod`, `LeakyBucketRateLimitMethod`, `SemaphoreRateLimitMethod`, or `CircuitBreakerRateLimitMethod`. In JSON configuration this is handled by the `RateLimit` section with its `Algorithm` discriminator — when writing C# code, always use `LimitMethod` directly.
+</ParamField>
+
+<ParamField path="MaxDelayInSeconds" type="int" default="0">
+  When greater than `0`, ThrottlingTroll will spin-wait (poll the counter every ~100 ms) for up to this many seconds instead of immediately returning `429`. Set this to implement delayed responses for bursty clients or to implement distributed critical sections alongside `SemaphoreRateLimitMethod`.
+</ParamField>
+
+<ParamField path="CostExtractor" type="Func<IHttpRequestProxy, long>">
+  Per-rule override of the global `CostExtractor`. When set, this delegate is called for every request matching the rule to determine its cost. The default cost is `1`. Overrides `ThrottlingTrollOptions.CostExtractor` for this rule only.
+</ParamField>
+
+<ParamField path="ResponseFabric" type="Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>">
+  Per-rule override of the global response handler. Called when **this specific rule** is exceeded. Overrides `ThrottlingTrollOptions.ResponseFabric` for this rule only. Uses the same signature as the global `ResponseFabric`.
+</ParamField>
+
+<ParamField path="Name" type="string">
+  A human-readable label for telemetry. Appears as the OpenTelemetry activity name in distributed traces. If omitted, a 10-character hash of the rule's parameters is used.
+</ParamField>
+
+### Inherited RequestFilter fields
+
+Every `ThrottlingTrollRule` inherits these filter fields from `RequestFilter`:
+
+| Property | Type | Description |
+|---|---|---|
+| `UriString` | string | Case-insensitive substring to match in the request URI. |
+| `UriPattern` | string | Regex pattern matched against the full request URI. Overshadows `UriString`. |
+| `Method` | string | Comma-separated HTTP methods, e.g. `"GET,POST"`. Empty means any method. |
+| `HeaderName` | string | HTTP header that must be present for the rule to match. |
+| `HeaderValue` | string | Exact required value for `HeaderName`. |
+| `HeaderValuePattern` | string | Regex for the value of `HeaderName`. Overshadows `HeaderValue`. |
+| `IdentityId` | string | Matches requests whose extracted identity equals this string. |
+| `IdentityIdExtractor` | `Func<IHttpRequestProxy, string>` | Per-rule delegate to extract an identity from the request. Overrides the global extractor. |
+
+## Per-rule identity and cost extraction
+
+Both identity and cost can be customised at the rule level, making it easy to apply different quota models to different endpoints:
+
+```csharp
+options.Config = new ThrottlingTrollConfig
+{
+    Rules =
+    [
+        new ThrottlingTrollRule
+        {
+            UriPattern = "/api/search",
+            LimitMethod = new FixedWindowRateLimitMethod
+            {
+                PermitLimit = 1000,
+                IntervalInSeconds = 60
+            },
+            // Each authenticated user gets their own counter
+            IdentityIdExtractor = request =>
+            {
+                if (request.Headers.TryGetValue("Authorization", out var auth))
+                    return auth;
+                return request.Headers.TryGetValue("X-Forwarded-For", out var ip) ? ip : "unknown";
+            },
+            // Charge 10 units for complex queries, 1 for simple ones
+            CostExtractor = request =>
+                request.Query.ContainsKey("complex") ? 10 : 1
+        }
+    ]
+};
+```
+
+## Multiple middleware instances
+
+Each call to `UseThrottlingTroll` creates an independent middleware pipeline stage with its own configuration, counter store, and response fabric. This lets you layer different policies — for example a global per-IP limit as an outer layer and a fine-grained per-user limit as an inner layer:
+
+```csharp
+// Outer layer: coarse IP-based limit using a shared Redis store
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new RedisCounterStore(redis);
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                LimitMethod = new FixedWindowRateLimitMethod { PermitLimit = 500, IntervalInSeconds = 60 },
+                IdentityIdExtractor = r => r.Headers.TryGetValue("X-Forwarded-For", out var ip) ? ip : "unknown"
+            }
+        ]
+    };
+});
+
+// Inner layer: fine-grained API-key-based limit
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new RedisCounterStore(redis);
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/",
+                LimitMethod = new SlidingWindowRateLimitMethod { PermitLimit = 100, IntervalInSeconds = 60, NumOfBuckets = 6 },
+                IdentityIdExtractor = r => r.Headers.TryGetValue("X-Api-Key", out var key) ? key : "anonymous"
+            }
+        ]
+    };
+});
+```
+
+<Note>
+  `Config` (programmatic), `appsettings.json` rules, and `[ThrottlingTroll]` attributes are all merged together automatically before the middleware starts. You do not need to choose one approach exclusively — they complement each other. For example, you can define global limits in `appsettings.json` and per-endpoint overrides with attributes, while using `Config` in code for anything that requires runtime values.
+</Note>
+
+<Tip>
+  Multiple calls to `UseThrottlingTroll` create fully independent middleware instances. Each instance has its own rule set, counter store, and response fabric. There is no shared state between instances (unless they point to the same counter store). Use this to build layered defence-in-depth policies or to apply different throttling strategies to different URL prefixes.
+</Tip>

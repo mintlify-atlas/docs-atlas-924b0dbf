@@ -1,0 +1,122 @@
+---
+title: "Redis Counter Store for ThrottlingTroll Distributed Rate Limiting"
+sidebarTitle: "Redis"
+description: "Use RedisCounterStore with StackExchange.Redis to store ThrottlingTroll rate limit counters in Redis for high-throughput distributed deployments."
+---
+
+`RedisCounterStore` uses [StackExchange.Redis](https://stackexchange.github.io/StackExchange.Redis/) to persist rate limit counters in Redis, making it the recommended choice for production environments where you need fast, consistent, and reliable distributed rate limiting. All counter operations are implemented as atomic Lua scripts executed directly on the Redis server, so there are no race conditions even under heavy concurrent load.
+
+## Installation
+
+```bash
+dotnet add package ThrottlingTroll.CounterStores.Redis
+```
+
+## Constructor
+
+`RedisCounterStore` takes a single argument — a `StackExchange.Redis` connection multiplexer:
+
+```csharp
+public RedisCounterStore(IConnectionMultiplexer redis)
+```
+
+The `IConnectionMultiplexer` is the main entry point provided by StackExchange.Redis. Creating a multiplexer is expensive, so it should be created once and reused for the lifetime of the application.
+
+## Registering via Dependency Injection (recommended)
+
+Register both the multiplexer and the store as singletons. This is the preferred pattern because it lets the multiplexer be shared with other parts of your application (e.g. caching, pub/sub).
+
+```csharp
+using StackExchange.Redis;
+using ThrottlingTroll;
+
+// Create the multiplexer once — this is expensive and should be a singleton
+services.AddSingleton<IConnectionMultiplexer>(
+    ConnectionMultiplexer.Connect("your-redis-host:6379")
+);
+
+// RedisCounterStore will resolve IConnectionMultiplexer from DI automatically
+services.AddSingleton<ICounterStore, RedisCounterStore>();
+```
+
+## Registering via `ThrottlingTrollOptions`
+
+For simpler setups, you can pass the store directly when configuring the middleware:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new RedisCounterStore(
+        ConnectionMultiplexer.Connect("your-redis-host:6379")
+    );
+});
+```
+
+## How Redis Keys Work
+
+ThrottlingTroll derives each counter key from a SHA-256 hash of the serialised rate limit rule definition, combined with an optional identity ID (e.g. the client's IP address or API key when `IdentityIdExtractor` is configured). This keeps keys short and collision-resistant regardless of how complex your rules are.
+
+Counter operations use Lua scripts to guarantee atomicity on the Redis server side:
+
+- **`IncrementAndGetAsync`** — calls `INCRBY` and conditionally sets the expiry with `PEXPIREAT` (for absolute TTL) or extends it with `PEXPIRE` (for incremental TTL), all in a single atomic script.
+- **`DecrementAsync`** — calls `DECRBY` and removes the key if the result drops below `1`, atomically.
+- **`GetAsync`** — reads the value with a plain `StringGetAsync`.
+
+## Full Configuration Example
+
+```csharp
+using StackExchange.Redis;
+using ThrottlingTroll;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    ConnectionMultiplexer.Connect(
+        builder.Configuration.GetConnectionString("Redis")
+    )
+);
+
+builder.Services.AddSingleton<ICounterStore, RedisCounterStore>();
+
+var app = builder.Build();
+
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        UniqueName = "my-api",
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/",
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 100,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+```
+
+<Warning>
+  Do **not** call `ConnectionMultiplexer.Connect()` inside `UseThrottlingTroll` or inside a factory delegate that runs per-request. Creating a connection multiplexer is a heavyweight operation. Create it once at application startup and register it as a singleton.
+</Warning>
+
+<Note>
+  Redis Cluster is supported by StackExchange.Redis. Provide your cluster endpoint (or comma-separated list of nodes) as the connection string. Note that Lua scripts used by `RedisCounterStore` operate on a single key at a time, so they are compatible with Redis Cluster's key-slot constraints.
+</Note>
+
+<Tip>
+  When multiple services or multiple ThrottlingTroll configurations share the same Redis instance, set `UniqueName` in `ThrottlingTrollConfig` to prefix every counter key with a service-specific string. This prevents counters from different services from interfering with each other:
+
+  ```csharp
+  options.Config = new ThrottlingTrollConfig
+  {
+      UniqueName = "order-service",
+      Rules = [ /* ... */ ]
+  };
+  ```
+</Tip>

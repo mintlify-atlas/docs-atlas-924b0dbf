@@ -1,0 +1,238 @@
+---
+title: "Use ThrottlingTroll in Any .NET Application"
+sidebarTitle: "Generic .NET"
+description: "Use ThrottlingTroll's IThrottlingTroll interface for rate limiting and circuit-breaking in console apps, workers, and any .NET code."
+---
+
+Since v8.0, ThrottlingTroll is no longer limited to web projects. You can instantiate `ThrottlingTroll.ThrottlingTroll` directly in any .NET application — a console app, a background worker service, a class library, or a Blazor app — and wrap arbitrary blocks of code with rate limits, semaphores, or circuit breakers. There is no need for an HTTP pipeline; ThrottlingTroll operates purely in-process and can optionally connect to a distributed counter store to coordinate limits across multiple instances.
+
+## How It Works
+
+All functionality is exposed through the `IThrottlingTroll` interface. You create an instance of `ThrottlingTroll.ThrottlingTroll`, pass it a `ThrottlingTrollConfig` containing your rules, and then call `WithThrottlingTroll(todo, onLimitExceeded)` around the code you want to protect. ThrottlingTroll checks the counters, runs `todo` when the limit allows it, and calls `onLimitExceeded` when it does not.
+
+<Steps>
+
+  <Step title="Install the NuGet package">
+    ```bash
+    dotnet add package ThrottlingTroll
+    ```
+  </Step>
+
+  <Step title="Create a ThrottlingTroll instance">
+    Instantiate `ThrottlingTroll.ThrottlingTroll` with a `ThrottlingTrollConfig` that describes your rules. The instance is thread-safe and should be created once and reused — it is a natural `static` field or singleton.
+
+    ```csharp
+    using ThrottlingTroll;
+
+    static IThrottlingTroll ThTr = new ThrottlingTroll.ThrottlingTroll(
+        new ThrottlingTrollConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    Name = "My circuit breaker",
+                    LimitMethod = new CircuitBreakerRateLimitMethod
+                    {
+                        PermitLimit = 3,
+                        IntervalInSeconds = 10,
+                        TrialIntervalInSeconds = 20
+                    }
+                }
+            ]
+        }
+    );
+    ```
+
+    Any of the five algorithms — `FixedWindowRateLimitMethod`, `SlidingWindowRateLimitMethod`, `LeakyBucketRateLimitMethod`, `SemaphoreRateLimitMethod`, and `CircuitBreakerRateLimitMethod` — can be used here.
+  </Step>
+
+  <Step title="Wrap code with WithThrottlingTroll">
+    Call `WithThrottlingTroll` and pass two async delegates: `todo` (the code to run when the limit is not exceeded) and `onLimitExceeded` (the fallback to run when the limit is exceeded). A `ThrottlingTrollContext` is passed to both.
+
+    ```csharp
+    await ThTr.WithThrottlingTroll(
+        async ctx =>
+        {
+            // Your code here — for CircuitBreaker, exceptions thrown here count as failures
+            await CallExternalService();
+        },
+        async ctx =>
+        {
+            // Called when the limit is exceeded
+            Console.WriteLine(
+                $"Circuit open. Retry after {ctx.ExceededLimit.RetryAfterInSeconds}s"
+            );
+        }
+    );
+    ```
+  </Step>
+
+  <Step title="Handle the onLimitExceeded callback">
+    Use `ThrottlingTrollContext` to inspect what happened and respond accordingly. The most important members are:
+
+    | Member | Description |
+    |--------|-------------|
+    | `ctx.LimitCheckResults` | All rules that were checked for this call, including those not exceeded. |
+    | `ctx.ExceededLimit` | The `LimitCheckResult` with the largest `RetryAfterInSeconds` value (i.e., the most constraining exceeded rule). `null` if no limit was exceeded. |
+    | `ctx.ExceededLimit.RetryAfterInSeconds` | How many seconds the caller should wait before retrying. |
+    | `ctx.ExceededLimit.Rule.Name` | The name of the rule that was exceeded, if you set one. |
+    | `ctx.ShouldContinueAsNormal` | Set this to `true` inside `onLimitExceeded` to make ThrottlingTroll continue executing `todo` anyway (useful for soft limits or logging-only modes). |
+
+    ```csharp
+    await ThTr.WithThrottlingTroll(
+        async ctx => await CallExternalService(),
+        async ctx =>
+        {
+            var exceeded = ctx.ExceededLimit;
+            Console.WriteLine(
+                $"Rule '{exceeded.Rule.Name}' exceeded. " +
+                $"Retry in {exceeded.RetryAfterInSeconds} seconds."
+            );
+        }
+    );
+    ```
+  </Step>
+
+</Steps>
+
+## Full Example: Circuit Breaker in a Console App
+
+The following complete example demonstrates a circuit breaker that allows up to 3 failures in 10 seconds. Once the circuit opens, a trial request is allowed every 20 seconds; when a trial succeeds, normal operation resumes.
+
+```csharp
+using ThrottlingTroll;
+
+static IThrottlingTroll ThTr = new ThrottlingTroll.ThrottlingTroll(
+    new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "My circuit breaker",
+                LimitMethod = new CircuitBreakerRateLimitMethod
+                {
+                    PermitLimit = 3,
+                    IntervalInSeconds = 10,
+                    TrialIntervalInSeconds = 20
+                }
+            }
+        ]
+    }
+
+    // Optionally pass a distributed counter store:
+    // , counterStore: new RedisCounterStore(ConnectionMultiplexer.Connect("localhost:6379"))
+);
+
+Console.WriteLine("Press Space to simulate a failure, any other key to simulate success:");
+
+while (true)
+{
+    var key = Console.ReadKey(intercept: true).Key;
+
+    try
+    {
+        await ThTr.WithThrottlingTroll(
+            async ctx =>
+            {
+                // Exceptions propagate out of todo and are tracked as failures by CircuitBreaker
+                if (key == ConsoleKey.Spacebar)
+                {
+                    throw new Exception("Simulated failure");
+                }
+
+                Console.WriteLine("Request succeeded.");
+            },
+            async ctx =>
+            {
+                var trialInterval =
+                    ((CircuitBreakerRateLimitMethod)ctx.ExceededLimit.Rule.LimitMethod)
+                    .TrialIntervalInSeconds;
+
+                Console.WriteLine(
+                    $"Circuit is open ({ctx.ExceededLimit.Rule.Name}). " +
+                    $"Next trial in {trialInterval}s."
+                );
+            }
+        );
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Exception: {ex.Message}");
+    }
+}
+```
+
+## The IThrottlingTroll Interface
+
+`IThrottlingTroll` exposes the following methods:
+
+| Method | Description |
+|--------|-------------|
+| `WithThrottlingTroll<T>(todo, onLimitExceeded, methodName?)` | Applies limits to `todo`. Returns `T`. `methodName` is an optional string passed as the request "method", allowing rules that filter by method name. |
+| `WithThrottlingTroll(todo, onLimitExceeded, methodName?)` | Same as above but for `void`-style async code (returns `Task`). |
+| `WithThrottlingTroll<T>(requestProxy, todo, onLimitExceeded)` | Advanced overload: supply your own `IHttpRequestProxy` implementation to control how ThrottlingTroll identifies and filters requests. |
+| `WithThrottlingTroll(requestProxy, todo, onLimitExceeded)` | Same as above, `void`-style. |
+| `GetCurrentConfig()` | Returns a snapshot of the active `ThrottlingTrollConfig` (all rules currently loaded). |
+
+## Using IThrottlingTroll in Worker Services with DI
+
+In a hosted worker service, you can register `ThrottlingTroll.ThrottlingTroll` as a singleton and inject `IThrottlingTroll` wherever you need it:
+
+```csharp
+using ThrottlingTroll;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// Register as singleton
+builder.Services.AddSingleton<IThrottlingTroll>(_ =>
+    new ThrottlingTroll.ThrottlingTroll(
+        new ThrottlingTrollConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    LimitMethod = new SemaphoreRateLimitMethod { PermitLimit = 5 }
+                }
+            ]
+        }
+    )
+);
+
+builder.Services.AddHostedService<MyWorker>();
+
+builder.Build().Run();
+```
+
+Then inject `IThrottlingTroll` into your worker or service class as you would any other dependency.
+
+<Tip>
+  For worker services that call multiple external endpoints, create one `IThrottlingTroll` instance per logical limit and give each instance a `ThrottlingTrollConfig` with a meaningful `UniqueName`. This ensures counter cache keys do not collide when you later switch to a distributed counter store.
+</Tip>
+
+<Note>
+  To make limits distributed across multiple running instances of your application, pass a counter store to the `ThrottlingTroll.ThrottlingTroll` constructor:
+
+  ```csharp
+  new ThrottlingTroll.ThrottlingTroll(
+      config,
+      counterStore: new RedisCounterStore(
+          ConnectionMultiplexer.Connect("your-redis-connection-string")
+      )
+  )
+  ```
+
+  Install `ThrottlingTroll.CounterStores.Redis` first:
+
+  ```bash
+  dotnet add package ThrottlingTroll.CounterStores.Redis
+  ```
+</Note>
+
+## Next Steps
+
+- [Rate Limiting Algorithms](/algorithms/fixed-window) — Understand the trade-offs between FixedWindow, SlidingWindow, LeakyBucket, Semaphore, and CircuitBreaker
+- [Counter Stores overview](/counter-stores/overview) — Distribute counters with Redis, Azure Table Storage, or EF Core
+- [Reactive configuration](/configuration/reactive) — Update rules at runtime without restarting your application

@@ -1,0 +1,192 @@
+---
+title: "Automatic Retries and Delays for Egress Throttling"
+sidebarTitle: "Retries & Delays"
+description: "Configure ThrottlingTroll to automatically retry outbound HttpClient requests with delays when egress rate limits are exceeded, using MaxDelayInSeconds and ResponseFabric."
+---
+
+When an egress limit is exceeded, the default behaviour is to return a `429 TooManyRequests` response immediately and let calling code decide what to do. For many use cases — burst traffic smoothing, polite retry loops, concurrency control — you want ThrottlingTroll to handle the wait-and-retry cycle automatically. Two mechanisms make this possible: `MaxDelayInSeconds` for locally-enforced limits, and `ResponseFabric` for full programmatic control including retrying on upstream 429 responses.
+
+## MaxDelayInSeconds for Egress
+
+Setting `MaxDelayInSeconds` on a rule tells ThrottlingTroll to spin-wait until the rate counter drops below the limit, rather than immediately rejecting the call. If the counter does not clear within the given number of seconds, the handler returns `429` at that point.
+
+This is identical in behaviour to `MaxDelayInSeconds` on ingress rules, but applied to outbound calls:
+
+```csharp
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.example.com",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 10,
+                        IntervalInSeconds = 1
+                    },
+                    MaxDelayInSeconds = 10  // Wait up to 10s for a slot, then retry
+                }
+            ]
+        };
+    });
+```
+
+With this configuration, if the 10-requests-per-second limit is already saturated, ThrottlingTroll holds the outbound call for up to 10 seconds until a counter slot becomes available. Only if the window still hasn't cleared after 10 seconds does it return `429` to the caller.
+
+## ResponseFabric for Custom Retry Logic
+
+`ResponseFabric` is a delegate invoked whenever a 429 response is present — either because a **local rule was exceeded**, or because the **upstream service itself returned 429**. This makes it the right place to implement retry logic that reacts to upstream rate limiting, not just your own locally-tracked limits.
+
+The delegate signature is:
+
+```csharp
+Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>
+```
+
+Inside the delegate, setting `responseProxy.ShouldRetry = true` causes the handler to re-send the original request after the delegate returns. The handler reads the `Retry-After` header from the response to determine how long to wait before retrying; if no such header is present it defaults to 5 seconds.
+
+### Retrying on Upstream 429
+
+This pattern lets ThrottlingTroll automatically respect `Retry-After` headers from external APIs:
+
+```csharp
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.example.com",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 100,
+                        IntervalInSeconds = 60
+                    }
+                }
+            ]
+        };
+
+        // Automatically retry on 429 from upstream, respecting Retry-After
+        options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+        {
+            var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 5;
+
+            await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
+
+            // Signal ThrottlingTroll to retry the request
+            responseProxy.ShouldRetry = true;
+        };
+    });
+```
+
+When `ShouldRetry` is `true`, the handler loops back and re-sends the `HttpRequestMessage`. The `responseProxy.RetryCount` property records how many retry attempts have been made so far for the current request, which you can use to bound the retry loop.
+
+<Warning>
+Setting `ShouldRetry = true` unconditionally creates an infinite retry loop. Always guard it with a maximum retry count or a time budget:
+
+```csharp
+options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+{
+    // Give up after 3 retries
+    if (responseProxy.RetryCount >= 3)
+    {
+        responseProxy.ShouldRetry = false;
+        return;
+    }
+
+    var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 5;
+    await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
+
+    responseProxy.ShouldRetry = true;
+};
+```
+</Warning>
+
+### Combined Local Limit + Upstream Retry
+
+You can combine both approaches: a local rule prevents bursting, and `ResponseFabric` handles the case where the upstream still returns 429 despite the local limit:
+
+```csharp
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.example.com",
+                    LimitMethod = new SlidingWindowRateLimitMethod
+                    {
+                        PermitLimit = 50,
+                        IntervalInSeconds = 10,
+                        NumOfBuckets = 5
+                    },
+                    MaxDelayInSeconds = 5  // Wait up to 5s for a local slot
+                }
+            ]
+        };
+
+        // Also retry if the upstream still returns 429
+        options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+        {
+            if (responseProxy.RetryCount >= 5)
+            {
+                responseProxy.ShouldRetry = false;
+                return;
+            }
+
+            var retryAfterSeconds = responseProxy.Response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 2;
+            await Task.Delay(TimeSpan.FromSeconds(retryAfterSeconds), cancellationToken);
+
+            responseProxy.ShouldRetry = true;
+        };
+    });
+```
+
+### Per-Rule ResponseFabric
+
+`ResponseFabric` can also be set directly on a `ThrottlingTrollRule` rather than on `ThrottlingTrollOptions`. A per-rule fabric takes precedence over the handler-level one, allowing different retry strategies for different URI patterns:
+
+```csharp
+services.AddHttpClient("ExternalApi")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.example.com/sensitive",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 5,
+                        IntervalInSeconds = 1
+                    },
+                    // This rule's fabric overrides the handler-level one
+                    ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+                    {
+                        if (responseProxy.RetryCount < 2)
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                            responseProxy.ShouldRetry = true;
+                        }
+                    }
+                }
+            ]
+        };
+    });
+```
+
+<Tip>
+Use `SemaphoreRateLimitMethod` with `PermitLimit = 1` to strictly serialize outbound calls to an endpoint, so no two concurrent requests are ever in-flight at the same time. Combined with `MaxDelayInSeconds`, waiting callers will queue up and proceed one-by-one rather than receiving an immediate 429.
+</Tip>

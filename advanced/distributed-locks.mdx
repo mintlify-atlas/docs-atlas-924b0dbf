@@ -1,0 +1,193 @@
+---
+title: "Distributed Locks and Named Locks with ThrottlingTroll"
+sidebarTitle: "Distributed Locks"
+description: "Use ThrottlingTroll's Semaphore algorithm with PermitLimit=1 and a Redis counter store to implement distributed locks and named distributed locks in .NET."
+---
+
+ThrottlingTroll can act as a distributed lock by combining the `SemaphoreRateLimitMethod` with `PermitLimit = 1` and a distributed counter store such as Redis. Because the Semaphore algorithm uses an atomic increment-and-check backed by a shared counter, setting the limit to exactly one permit means only one instance across your entire fleet can hold the "lock" at any time. The lock automatically expires after `TimeoutInSeconds` seconds, preventing deadlocks caused by crashed nodes.
+
+## How the Semaphore algorithm works as a lock
+
+`SemaphoreRateLimitMethod` tracks the number of *concurrently executing* requests for a given counter key. On entry it atomically increments the counter — if the result exceeds `PermitLimit`, the increment is immediately reversed and the caller is told to back off. On exit (when the protected code finishes) the counter is decremented, freeing the slot for the next caller.
+
+With `PermitLimit = 1`:
+- The counter is either **0** (lock free) or **1** (lock held).
+- The `TimeoutInSeconds` value is used both as the suggested `Retry-After` and as the absolute TTL on the counter. If the holder crashes before releasing, the counter expires after `TimeoutInSeconds` seconds, automatically freeing the lock.
+
+<Warning>
+Always set `TimeoutInSeconds` high enough to cover the longest reasonable execution of your protected code, but not so high that a crashed instance blocks the resource for an unacceptable duration. The default is **100 seconds**.
+</Warning>
+
+---
+
+## Simple distributed lock
+
+Use the generic `ThrottlingTroll` class from the `ThrottlingTroll` NuGet package together with `RedisCounterStore`:
+
+```csharp
+using StackExchange.Redis;
+using ThrottlingTroll;
+using ThrottlingTroll.CounterStores.Redis;
+
+var throttler = new ThrottlingTroll.ThrottlingTroll(
+    config: new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "CriticalSection",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 1,
+                    TimeoutInSeconds = 60   // lock expires after 60 seconds
+                }
+            }
+        ]
+    },
+    counterStore: new RedisCounterStore(
+        ConnectionMultiplexer.Connect("localhost:6379"))
+);
+
+await throttler.WithThrottlingTroll(
+    todo: async ctx =>
+    {
+        // Only one instance across the fleet executes this block at a time
+        await DoExclusiveWork();
+    },
+    onLimitExceeded: async ctx =>
+    {
+        // Another instance is already holding the lock
+        Console.WriteLine("Could not acquire lock — retrying later");
+    }
+);
+```
+
+`WithThrottlingTroll` calls `todo` when the permit is granted, or `onLimitExceeded` when it is not. The permit is automatically released (counter decremented) after `todo` completes, even if it throws.
+
+---
+
+## Named distributed locks
+
+Named locks give each distinct resource its own counter, so concurrent operations on *different* resources can proceed in parallel while the same resource is still protected.
+
+Provide a `methodName` argument to `WithThrottlingTroll`. Internally this value is placed into `IHttpRequestProxy.Method`, which you can then reference inside an `IdentityIdExtractor` to derive a per-resource counter key.
+
+```csharp
+using StackExchange.Redis;
+using ThrottlingTroll;
+using ThrottlingTroll.CounterStores.Redis;
+
+var throttler = new ThrottlingTroll.ThrottlingTroll(
+    config: new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "PerOrderLock",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 1,
+                    TimeoutInSeconds = 30
+                },
+                // Derive the counter key from the methodName passed to WithThrottlingTroll
+                IdentityIdExtractor = request => request.Method
+            }
+        ]
+    },
+    counterStore: new RedisCounterStore(
+        ConnectionMultiplexer.Connect("localhost:6379"))
+);
+
+// Protect order processing per order ID — different orders run concurrently,
+// but the same order can only be processed by one instance at a time.
+await throttler.WithThrottlingTroll(
+    todo: async ctx => await ProcessOrder(orderId),
+    onLimitExceeded: async ctx =>
+        Console.WriteLine($"Order {orderId} is already being processed"),
+    methodName: orderId    // becomes the identity ID via the extractor above
+);
+```
+
+<Tip>
+You can pass any arbitrary string as `methodName`. Good candidates include order IDs, user IDs, document keys, job names, or any other resource identifier that should be serialised.
+</Tip>
+
+---
+
+## Ingress HTTP endpoint lock (ASP.NET Core)
+
+You can apply the same pattern to ASP.NET Core ingress rules when you want to serialise concurrent HTTP requests for the same resource:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "PerOrderProcessingLock",
+                UriPattern = "/api/orders/process",
+                Method = "POST",
+                LimitMethod = new SemaphoreRateLimitMethod
+                {
+                    PermitLimit = 1,
+                    TimeoutInSeconds = 60
+                },
+                // Create a separate lock per order ID supplied in the header
+                IdentityIdExtractor = request =>
+                    request.Headers.TryGetValue("X-Order-Id", out var orderId)
+                        ? orderId
+                        : string.Empty
+            }
+        ]
+    };
+});
+```
+
+Requests with different `X-Order-Id` values proceed concurrently; two requests carrying the same order ID are serialised — the second caller receives `429 TooManyRequests` with a `Retry-After` header.
+
+---
+
+## Queue callers instead of rejecting them
+
+Set `MaxDelayInSeconds` on the rule to make ThrottlingTroll spin-wait for a free slot rather than immediately returning `429 TooManyRequests`. This turns the lock into a bounded queue:
+
+```csharp
+new ThrottlingTrollRule
+{
+    Name = "QueuedCriticalSection",
+    LimitMethod = new SemaphoreRateLimitMethod
+    {
+        PermitLimit = 1,
+        TimeoutInSeconds = 60
+    },
+    MaxDelayInSeconds = 30   // wait up to 30 s for a free slot before giving up
+}
+```
+
+A `ThrottlingTroll.Waiting` span is emitted for each spin-wait period, so you can observe queue depths in your tracing backend.
+
+---
+
+## Deduplication with `ReleaseAfterSeconds`
+
+`SemaphoreRateLimitMethod` also exposes `ReleaseAfterSeconds`. When set, the slot is held for an extra *N* seconds after the protected code completes. This prevents a second identical request from starting before the first one's side-effects are fully visible:
+
+```csharp
+new SemaphoreRateLimitMethod
+{
+    PermitLimit = 1,
+    TimeoutInSeconds = 60,
+    ReleaseAfterSeconds = 5   // keep the slot locked for 5 s after completion
+}
+```
+
+This is the mechanism behind ThrottlingTroll's [request deduplication](/ingress/request-deduplication) feature.
+
+<Note>
+Distributed locks via ThrottlingTroll rely on atomic counter operations in Redis (Lua scripts using `INCRBY` / `DECRBY`). They are *optimistic* cooperative locks — not true OS-level mutexes. Do not use them as the sole guard for financial transactions or any workload that requires strict ACID semantics.
+</Note>

@@ -1,0 +1,112 @@
+---
+title: "Leaky Bucket Rate Limiting Algorithm in ThrottlingTroll"
+sidebarTitle: "Leaky Bucket"
+description: "LeakyBucketRateLimitMethod evenly distributes allowed requests across the time window by adding a calculated delay, eliminating traffic spikes entirely."
+---
+
+The Leaky Bucket algorithm takes a fundamentally different approach from Fixed Window and Sliding Window. Rather than counting requests and rejecting the excess, Leaky Bucket acts as a queue with a constant drain rate. Accepted requests are not returned immediately — instead each request is delayed by an amount proportional to its position in the queue. The result is that traffic leaving your endpoint is perfectly smooth, with one response delivered every `IntervalInSeconds / PermitLimit` seconds, regardless of how bursty the incoming traffic is.
+
+When the queue is full (more than `PermitLimit` concurrent requests are waiting), new arrivals are rejected with `429 TooManyRequests`. All other requests are accepted but held until their slot in the queue is reached. This makes Leaky Bucket the best fit for situations where you care about the *output rate* — protecting a downstream API with a hard quota, smoothing writes to a database, or throttling email delivery — rather than just limiting peak concurrency.
+
+## Class
+
+`LeakyBucketRateLimitMethod`
+
+## Properties
+
+<ParamField path="PermitLimit" type="int" required>
+  The maximum number of requests that can be queued simultaneously. This is both the queue depth and the number of requests allowed per `IntervalInSeconds`. Requests beyond this are rejected with `429 TooManyRequests` without being queued.
+</ParamField>
+
+<ParamField path="IntervalInSeconds" type="double" required>
+  The window size in seconds. Together with `PermitLimit`, this defines the drain rate: one request is released every `IntervalInSeconds / PermitLimit` seconds. Fractional values are supported, so you can express sub-second drain rates.
+</ParamField>
+
+<ParamField path="RetryAfterInSeconds" type="int" readonly>
+  Computed as `Math.Ceiling(IntervalInSeconds)`. Written into the `Retry-After` response header for rejected requests so clients know when the queue is likely to have capacity again.
+</ParamField>
+
+## How the delay is calculated
+
+For each accepted request ThrottlingTroll performs an atomic increment to determine the request's position (`count`) in the current queue, then applies:
+
+```
+delay = (IntervalInSeconds / PermitLimit) × (count - 1)
+```
+
+The first request in a new window (`count = 1`) has zero delay and is returned immediately. The second waits one slot, the third waits two slots, and so on. This spreads `PermitLimit` responses evenly across `IntervalInSeconds`.
+
+## Usage
+
+### Programmatic configuration
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/send-email",
+                LimitMethod = new LeakyBucketRateLimitMethod
+                {
+                    PermitLimit = 10,
+                    IntervalInSeconds = 60  // 1 request released every 6 seconds
+                }
+            }
+        ]
+    };
+});
+```
+
+### Attribute (declarative) configuration
+
+```csharp
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.LeakyBucket,
+    PermitLimit = 10,
+    IntervalInSeconds = 60)]
+public async Task<IActionResult> SendEmail([FromBody] EmailRequest request)
+{
+    await _emailService.SendAsync(request);
+    return Ok();
+}
+```
+
+### appsettings.json configuration
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/send-email",
+        "RateLimit": {
+          "Algorithm": "LeakyBucket",
+          "PermitLimit": 10,
+          "IntervalInSeconds": 60
+        }
+      }
+    ]
+  }
+}
+```
+
+## Comparison with Fixed Window
+
+| | Fixed Window | Leaky Bucket |
+|---|---|---|
+| **Burst behaviour** | Allows up to 2× PermitLimit at window boundaries | No bursts — output is a steady stream |
+| **Latency impact** | None — requests are accepted or rejected immediately | Accepted requests are delayed by their queue position |
+| **Rejected requests** | Requests exceeding PermitLimit are rejected with 429 | Requests beyond the queue depth are rejected with 429 |
+| **Best for** | APIs where a short burst is acceptable | Outbound calls, email delivery, DB writes requiring smooth output |
+
+<Note>
+  **Leaky Bucket introduces latency.** Accepted requests are artificially delayed inside the middleware — they do not return until their queued slot is reached. Ensure that client-side timeouts and server-side request timeout configurations are large enough to accommodate the maximum queue wait time, which is `IntervalInSeconds × (PermitLimit - 1) / PermitLimit` seconds in the worst case.
+</Note>
+
+<Tip>
+  Leaky Bucket is ideal for rate limiting calls to external APIs where you need to honour a provider's rate limit without dropping requests. Pair it with an egress rule on your `HttpClient` so that outgoing calls are automatically spaced out, removing the need for manual `Task.Delay` calls in your business logic.
+</Tip>

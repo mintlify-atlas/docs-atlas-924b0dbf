@@ -1,0 +1,144 @@
+---
+title: "Egress Throttling: Rate Limit Outbound HttpClient Calls"
+sidebarTitle: "Overview"
+description: "ThrottlingTroll egress throttling wraps HttpClient as a DelegatingHandler to limit outbound calls to external APIs without making the actual network request."
+---
+
+When your service calls external APIs — payment processors, partner services, upstream data providers — it must respect their published rate limits. Violating those limits can result in bans, degraded service, or cascading failures across your system. ThrottlingTroll egress throttling lets you declare those limits in your own configuration and enforce them locally, so your `HttpClient` calls never exceed the allowed rate in the first place.
+
+## How It Works
+
+Egress throttling is implemented as an [`HttpClient` DelegatingHandler](https://learn.microsoft.com/en-us/aspnet/web-api/overview/advanced/httpclient-message-handlers#custom-message-handlers). When an outbound call would exceed a configured rule, `ThrottlingTrollHandler` returns a `429 TooManyRequests` response **locally**, before the network request is ever made. This keeps your outbound call rate within bounds and avoids receiving 429s from the upstream service.
+
+```
+YourService ──► HttpClient.SendAsync()
+                    │
+                    ▼
+              [ThrottlingTrollHandler]
+                    │
+          limit exceeded?
+          ┌─────Yes─┴─────No──────────┐
+          ▼                           ▼
+   ❌ 429 TooManyRequests    🌐 actual HTTP call
+   (no network request)       ✅ 200 OK
+```
+
+## Registering the Egress Handler
+
+Call `AddThrottlingTrollMessageHandler` on the named or typed `HttpClient` registration in `Program.cs` or `Startup.cs`:
+
+```csharp
+// Program.cs
+services.AddHttpClient("MyExternalClient")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.Config = new ThrottlingTrollEgressConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "api.example.com/v1",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 100,
+                        IntervalInSeconds = 60
+                    }
+                }
+            ]
+        };
+    });
+```
+
+## Using the Configured Client
+
+Inject `IHttpClientFactory` and create the named client as usual. When the locally-enforced limit is hit, `GetAsync` returns a `429` response without ever touching the network:
+
+```csharp
+public class MyService
+{
+    private readonly HttpClient _client;
+
+    public MyService(IHttpClientFactory factory)
+    {
+        _client = factory.CreateClient("MyExternalClient");
+    }
+
+    public async Task<string> GetDataAsync()
+    {
+        var response = await _client.GetAsync("https://api.example.com/v1/data");
+
+        if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = response.Headers.RetryAfter?.Delta;
+            // Handle locally-generated 429 — no upstream call was made
+        }
+
+        return await response.Content.ReadAsStringAsync();
+    }
+}
+```
+
+## ThrottlingTrollEgressConfig
+
+`ThrottlingTrollEgressConfig` extends `ThrottlingTrollConfig` with one additional property:
+
+| Property | Type | Description |
+|---|---|---|
+| `PropagateToIngress` | `bool` | When `true`, a 429 from the upstream service is automatically bubbled up to the ingress middleware, which returns 429 to your own caller. See [Propagation](/egress/propagation). |
+
+All other `ThrottlingTrollConfig` properties (`Rules`, `AllowList`, `UniqueName`) are inherited unchanged.
+
+## Rule Matching Against Outgoing URIs
+
+Egress rules use the same `RequestFilter` matching system as ingress rules, but filters are evaluated against the **outgoing request** rather than an incoming one:
+
+| Filter field | Matched against |
+|---|---|
+| `UriPattern` | Full outgoing request URI (regex, case-insensitive) |
+| `UriString` | Substring match on the outgoing URI |
+| `Method` | Outgoing HTTP method (e.g. `"GET"`, `"POST"`) |
+| `HeaderName` / `HeaderValue` | Request headers sent to the external service |
+
+An empty or null `UriPattern` and `UriString` match **all** outgoing requests from that `HttpClient`.
+
+## Configuration via appsettings.json
+
+Rules can also be loaded from `appsettings.json`. The default section name for egress is `ThrottlingTrollEgress` (compared to `ThrottlingTrollIngress` for ingress middleware):
+
+```json
+{
+  "ThrottlingTrollEgress": {
+    "Rules": [
+      {
+        "UriPattern": "api.example.com",
+        "RateLimit": {
+          "Algorithm": "SlidingWindow",
+          "PermitLimit": 200,
+          "IntervalInSeconds": 60,
+          "NumOfBuckets": 6
+        }
+      }
+    ]
+  }
+}
+```
+
+You can override the section name by setting `options.ConfigSectionName` in the handler registration:
+
+```csharp
+services.AddHttpClient("MyExternalClient")
+    .AddThrottlingTrollMessageHandler(options =>
+    {
+        options.ConfigSectionName = "MyCustomEgressSection";
+    });
+```
+
+<Note>
+Egress counters are stored under an `"Egress"` key prefix, completely separate from ingress counters. Configuring the same `UriPattern` in both ingress and egress rules will never cause counter collisions — each side maintains its own independent counts.
+</Note>
+
+## Next Steps
+
+- [Retries & Delays](/egress/delays-and-retries) — automatically retry outbound calls when a limit is exceeded or when the upstream returns 429
+- [Propagation](/egress/propagation) — forward upstream 429 responses back to your own callers

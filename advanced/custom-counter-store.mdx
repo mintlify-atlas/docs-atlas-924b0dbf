@@ -1,0 +1,232 @@
+---
+title: "Implement a Custom Counter Store for ThrottlingTroll"
+sidebarTitle: "Custom Counter Store"
+description: "Implement the ICounterStore interface to create a custom ThrottlingTroll counter store backed by any storage system your application already uses."
+---
+
+ThrottlingTroll separates its rate-limiting logic from the underlying storage completely. The only coupling point is the `ICounterStore` interface. If none of the built-in stores — `MemoryCacheCounterStore`, `RedisCounterStore`, `AzureTableCounterStore`, `DistributedCacheCounterStore`, or `EfCoreCounterStore` — fits your deployment, you can implement `ICounterStore` on top of any storage system: a relational database, a document store, an in-process data structure, or even an external API.
+
+## The `ICounterStore` interface
+
+```csharp
+namespace ThrottlingTroll
+{
+    public interface ICounterStore
+    {
+        /// <summary>
+        /// Gets the current counter value for the given key.
+        /// </summary>
+        Task<long> GetAsync(string key, IHttpRequestProxy request);
+
+        /// <summary>
+        /// Atomically increments the counter by cost and returns the new value.
+        /// Also sets or extends the counter's TTL according to the ttl argument.
+        /// </summary>
+        Task<long> IncrementAndGetAsync(
+            string key,
+            long cost,
+            CounterTtl ttl,
+            IHttpRequestProxy request);
+
+        /// <summary>
+        /// Decrements the counter by cost.
+        /// Called by SemaphoreRateLimitMethod when a protected request completes.
+        /// </summary>
+        Task DecrementAsync(string key, long cost, IHttpRequestProxy request);
+
+        /// <summary>
+        /// Logging utility injected by ThrottlingTroll. Do not set this yourself.
+        /// </summary>
+        Action<LogLevel, string> Log { get; set; }
+    }
+}
+```
+
+<ParamField path="key" type="string" required>
+  A SHA-256-derived string that uniquely identifies the counter. It encodes the rule's filter fields, the algorithm, and — when an `IdentityIdExtractor` is configured — the caller's identity. Treat it as an opaque string.
+</ParamField>
+
+<ParamField path="cost" type="long" required>
+  The amount to add to (or subtract from) the counter. Default is `1`; can be higher when a `CostExtractor` is configured.
+</ParamField>
+
+<ParamField path="ttl" type="CounterTtl" required>
+  Expiry instruction for the counter. Either `CounterAbsoluteTtl` or `CounterIncrementalTtl` (see below). TTL must only be applied when the new counter value is `≤ ttl.MaxCounterValueToSetTtl`.
+</ParamField>
+
+<ParamField path="request" type="IHttpRequestProxy" required>
+  The current request, available for reference. You may use it for per-partition routing or custom logging, but most stores ignore it.
+</ParamField>
+
+---
+
+## `CounterTtl` types
+
+`CounterTtl` is an abstract record with two concrete subtypes:
+
+```csharp
+// Expires at a fixed absolute UTC timestamp.
+// Used by FixedWindow, SlidingWindow, Semaphore, and CircuitBreaker.
+public record CounterAbsoluteTtl(DateTimeOffset Ttl, long MaxCounterValueToSetTtl)
+    : CounterTtl(MaxCounterValueToSetTtl);
+
+// Extends the TTL incrementally each time a new request is counted.
+// Used by LeakyBucket.
+public record CounterIncrementalTtl(TimeSpan Ttl, long MaxCounterValueToSetTtl)
+    : CounterTtl(MaxCounterValueToSetTtl);
+```
+
+`MaxCounterValueToSetTtl` is the threshold below which TTL should be set or extended. If the new counter value exceeds this threshold, the counter already has a TTL from a previous increment and you should leave it unchanged.
+
+---
+
+## Minimal in-memory example
+
+The following implementation mirrors `MemoryCacheCounterStore` using only a `ConcurrentDictionary`. It is not suitable for distributed deployments, but is a useful starting point for understanding the contract:
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using ThrottlingTroll;
+
+public class MyCustomCounterStore : ICounterStore
+{
+    private record Entry(long Count, DateTimeOffset ExpiresAt);
+
+    private readonly ConcurrentDictionary<string, Entry> _store = new();
+    private readonly SemaphoreSlim _lock = new(1, 1);
+
+    // Set by ThrottlingTroll — do not override
+    public Action<LogLevel, string> Log { get; set; }
+
+    public Task<long> GetAsync(string key, IHttpRequestProxy request)
+    {
+        if (_store.TryGetValue(key, out var entry) && entry.ExpiresAt > DateTimeOffset.UtcNow)
+            return Task.FromResult(entry.Count);
+
+        return Task.FromResult(0L);
+    }
+
+    public async Task<long> IncrementAndGetAsync(
+        string key,
+        long cost,
+        CounterTtl ttl,
+        IHttpRequestProxy request)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            _store.TryGetValue(key, out var existing);
+
+            bool expired = existing == null || existing.ExpiresAt <= DateTimeOffset.UtcNow;
+            long newCount = expired ? cost : existing.Count + cost;
+
+            DateTimeOffset newExpiry = existing?.ExpiresAt ?? default;
+
+            if (newCount <= ttl.MaxCounterValueToSetTtl)
+            {
+                newExpiry = ttl switch
+                {
+                    CounterAbsoluteTtl abs => abs.Ttl,
+                    CounterIncrementalTtl inc => (expired ? DateTimeOffset.UtcNow : newExpiry) + inc.Ttl,
+                    _ => throw new NotSupportedException()
+                };
+            }
+
+            _store[key] = new Entry(newCount, newExpiry);
+            return newCount;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task DecrementAsync(string key, long cost, IHttpRequestProxy request)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            if (!_store.TryGetValue(key, out var existing))
+                return;
+
+            long newCount = existing.Count - cost;
+
+            if (newCount > 0)
+                _store[key] = existing with { Count = newCount };
+            else
+                _store.TryRemove(key, out _);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+}
+```
+
+---
+
+## Registering your store
+
+**Via dependency injection (recommended):**
+
+```csharp
+// Register as singleton — counter stores are shared across all middleware instances
+builder.Services.AddSingleton<ICounterStore, MyCustomCounterStore>();
+```
+
+ThrottlingTroll will resolve the store from the DI container automatically when you call `UseThrottlingTroll()` or register the middleware.
+
+**Inline, at middleware configuration time:**
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new MyCustomCounterStore();
+
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules = [ /* your rules */ ]
+    };
+});
+```
+
+**With the generic `ThrottlingTroll` class (non-HTTP applications):**
+
+```csharp
+var throttler = new ThrottlingTroll.ThrottlingTroll(
+    config: new ThrottlingTrollConfig { Rules = [ /* … */ ] },
+    counterStore: new MyCustomCounterStore()
+);
+```
+
+---
+
+## Atomicity requirements
+
+<Warning>
+`IncrementAndGetAsync` **must be atomic** with respect to concurrent callers using the same `key`. If your storage does not natively support atomic increment (e.g. a plain SQL `UPDATE`), you must guard the read-modify-write with a distributed lock or an optimistic-concurrency retry loop. Without atomicity, two concurrent requests can both read the same value, both decide the limit has not been reached, and both proceed — defeating the purpose of rate limiting.
+</Warning>
+
+For `SemaphoreRateLimitMethod`, `DecrementAsync` must also be reliable. If a decrement fails (for example due to a network error), the semaphore slot is consumed until `TimeoutInSeconds` elapses. For this reason, `SemaphoreRateLimitMethod` sets `ShouldThrowOnFailures = true` by default, propagating storage errors as exceptions so callers are not silently allowed through.
+
+---
+
+## Using the `request` parameter
+
+Every method receives the current `IHttpRequestProxy`. While most stores ignore it, you can use it for:
+
+- **Per-partition storage** — route counters to different Redis databases or table partitions based on the request URI or a header.
+- **Custom logging** — include request metadata in your store's internal error logs alongside the counter key.
+
+<Note>
+The `request` parameter passed to counter-store methods is the same `IHttpRequestProxy` that ThrottlingTroll uses to evaluate rules. It exposes `.Method`, `.Uri`, `.UriWithoutQueryString`, `.Headers`, and `.AppendToContextItem(...)`. Do not use it to modify the response — the store is called deep inside the rate-limiting pipeline and response mutations at that point are unreliable.
+</Note>
+
+<Tip>
+Study `RedisCounterStore.cs` in the ThrottlingTroll source as a reference implementation. It demonstrates how to handle both `CounterAbsoluteTtl` and `CounterIncrementalTtl` atomically using Redis Lua scripts — a pattern you can adapt for any storage that supports server-side scripting or atomic compare-and-swap operations.
+</Tip>

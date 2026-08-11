@@ -1,0 +1,223 @@
+---
+title: "Per-Client Rate Limiting with Identity and Cost Extractors"
+sidebarTitle: "Identity & Cost"
+description: "Use IdentityIdExtractor to rate limit clients individually by IP, API key, JWT claim, or any custom logic. Use CostExtractor for weighted request pricing tiers."
+---
+
+By default, every request matching a rule shares a single counter — all clients collectively consume the same quota. Setting an `IdentityIdExtractor` on a rule changes this: ThrottlingTroll calls the extractor for every matching request and appends the returned string to the cache key, so **each unique identity gets its own independent counter**. One misbehaving client cannot affect the experience of well-behaved ones.
+
+---
+
+## IdentityIdExtractor
+
+`IdentityIdExtractor` is a `Func<IHttpRequestProxy, string>` that you attach to a `ThrottlingTrollRule`. It receives the incoming request and returns a string that uniquely identifies the caller for that rule. An empty string or `null` means the request is not identified, and it falls back to the shared counter.
+
+### Limit by IP address
+
+```csharp
+new ThrottlingTrollRule
+{
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 100,
+        IntervalInSeconds = 60
+    },
+    IdentityIdExtractor = request =>
+        (request as IncomingHttpRequestProxy)?.Request.HttpContext.Connection.RemoteIpAddress?.ToString()
+}
+```
+
+<Note>
+  Casting to `IncomingHttpRequestProxy` gives you access to the full `HttpContext`. For requests behind a reverse proxy or load balancer, prefer reading `X-Forwarded-For` from the headers instead of `RemoteIpAddress`, which will be the proxy's IP.
+</Note>
+
+### Limit by API key header
+
+```csharp
+new ThrottlingTrollRule
+{
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 1000,
+        IntervalInSeconds = 3600
+    },
+    IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("X-Api-Key", out var key) ? key : string.Empty
+}
+```
+
+Requests that do not carry the `X-Api-Key` header return `string.Empty` and share a single "anonymous" counter.
+
+### Limit by JWT claim
+
+```csharp
+new ThrottlingTrollRule
+{
+    LimitMethod = new SlidingWindowRateLimitMethod
+    {
+        PermitLimit = 50,
+        IntervalInSeconds = 60,
+        NumOfBuckets = 6
+    },
+    IdentityIdExtractor = request =>
+    {
+        var httpContext = (request as IncomingHttpRequestProxy)?.Request.HttpContext;
+        return httpContext?.User?.FindFirst("sub")?.Value ?? string.Empty;
+    }
+}
+```
+
+### Global default extractor
+
+Instead of repeating the same `IdentityIdExtractor` on every rule, you can set a default on `ThrottlingTrollOptions`. Any rule that does **not** define its own extractor will inherit this global one.
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("X-Api-Key", out var key) ? key : string.Empty;
+
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            // Inherits the global extractor — each API key gets its own counter
+            new ThrottlingTrollRule
+            {
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 500,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+```
+
+<Tip>
+  Defining `IdentityIdExtractor` in `ThrottlingTrollOptions` is the cleanest approach when the same extraction logic applies to most rules. Individual rules can still override it by setting their own `IdentityIdExtractor` property.
+</Tip>
+
+---
+
+## Extracting identity from the URI with UriPattern
+
+When `UriPattern` contains a named capture group called `ThrottlingTrollIdentityId`, ThrottlingTroll automatically extracts the matched text and uses it as the identity — no `IdentityIdExtractor` delegate required.
+
+```csharp
+// Each user ID in the URL gets its own counter:
+// /api/users/alice/orders → identity "alice"
+// /api/users/bob/orders  → identity "bob"
+new ThrottlingTrollRule
+{
+    UriPattern = @"/api/users/(?<ThrottlingTrollIdentityId>[^/]+)/orders",
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 20,
+        IntervalInSeconds = 60
+    }
+}
+```
+
+The same named group works in `HeaderValuePattern` when you want to extract an identity from a header value using a regex.
+
+---
+
+## Filtering rules to specific identities with IdentityId
+
+In addition to extracting identities for separate counters, you can restrict a rule to apply **only** to a particular identity. Set both `IdentityIdExtractor` and `IdentityId` together:
+
+```csharp
+// Only the "free-tier" API key is limited to 50 req/min; others pass through this rule
+new ThrottlingTrollRule
+{
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 50,
+        IntervalInSeconds = 60
+    },
+    IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("X-Api-Key", out var key) ? key : string.Empty,
+    IdentityId = "free-tier-key-abc123"
+}
+```
+
+---
+
+## CostExtractor
+
+Every request has a default cost of **1**, which counts as one unit against the limit. `CostExtractor` lets you assign a different cost to specific requests, making some requests "more expensive" than others. This is useful for:
+
+- **Bulk endpoints** where one request represents many operations.
+- **Pricing tiers** where free-tier clients are charged at a higher rate per call.
+
+`CostExtractor` is a `Func<IHttpRequestProxy, long>`. If it returns a value less than or equal to zero, the cost is treated as 1.
+
+### Charge bulk requests proportionally
+
+```csharp
+// The caller passes ?count=N; each item in the batch costs 1 unit
+new ThrottlingTrollRule
+{
+    UriPattern = "/api/export",
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 100,
+        IntervalInSeconds = 60
+    },
+    CostExtractor = request =>
+    {
+        var countStr = request.Query.TryGetValue("count", out var val) ? val.ToString() : "1";
+        return long.TryParse(countStr, out var count) ? count : 1;
+    }
+}
+```
+
+A caller requesting `?count=50` consumes 50 of the 100-unit budget in a single call.
+
+### Pricing tiers via cost multipliers
+
+```csharp
+// 10 000-unit pool per hour; free-tier callers are charged 10x per request
+new ThrottlingTrollRule
+{
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 10000,
+        IntervalInSeconds = 3600
+    },
+    IdentityIdExtractor = request =>
+        request.Headers.TryGetValue("X-Api-Key", out var key) ? key : string.Empty,
+    CostExtractor = request =>
+    {
+        var tier = request.Headers.TryGetValue("X-Tier", out var t) ? t.ToString() : "free";
+        return tier == "premium" ? 1L : 10L;
+    }
+}
+```
+
+With this configuration:
+- A **premium** caller can make up to 10 000 requests per hour (cost 1 each).
+- A **free-tier** caller effectively gets 1 000 requests per hour (cost 10 each).
+- Each identity (API key) has its own counter, so users do not interfere with each other.
+
+<Note>
+  If `CostExtractor` returns 0 or a negative number, ThrottlingTroll treats the cost as 1. This ensures that a misconfigured extractor cannot silently grant unlimited quota.
+</Note>
+
+### Global default CostExtractor
+
+Like `IdentityIdExtractor`, you can set a `CostExtractor` globally in `ThrottlingTrollOptions`. Rules that define their own `CostExtractor` override it; rules without one inherit the global extractor.
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    // All rules share this extractor unless overridden
+    options.CostExtractor = request =>
+    {
+        var tier = request.Headers.TryGetValue("X-Tier", out var t) ? t.ToString() : "free";
+        return tier == "premium" ? 1L : 5L;
+    };
+});
+```

@@ -1,0 +1,100 @@
+---
+title: "IDistributedCache Counter Store for ThrottlingTroll"
+sidebarTitle: "Distributed Cache"
+description: "Use DistributedCacheCounterStore to store ThrottlingTroll counters in any IDistributedCache implementation, including Redis, SQL Server, and NCache."
+---
+
+`DistributedCacheCounterStore` wraps ASP.NET Core's [`IDistributedCache`](https://learn.microsoft.com/en-us/aspnet/core/performance/caching/distributed) abstraction, giving you flexibility to back ThrottlingTroll's counters with whichever distributed cache technology your application already uses. Any cache provider that implements `IDistributedCache` will work: Redis (via `Microsoft.Extensions.Caching.StackExchangeRedis`), SQL Server (via `Microsoft.Extensions.Caching.SqlServer`), NCache, and others.
+
+## Installation
+
+```bash
+dotnet add package ThrottlingTroll.CounterStores.DistributedCache
+```
+
+## Constructor
+
+```csharp
+public DistributedCacheCounterStore(IDistributedCache cache)
+```
+
+The constructor accepts any registered `IDistributedCache` implementation. You typically resolve it through DI rather than instantiating it manually.
+
+## Registration Examples
+
+### Redis distributed cache
+
+```csharp
+// 1. Register the Redis distributed cache
+services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = "your-redis-host:6379";
+});
+
+// 2. Register DistributedCacheCounterStore — IDistributedCache is resolved from DI
+services.AddSingleton<ICounterStore>(provider =>
+    new DistributedCacheCounterStore(
+        provider.GetRequiredService<IDistributedCache>()
+    )
+);
+```
+
+### SQL Server distributed cache
+
+```csharp
+// 1. Register SQL Server distributed cache
+services.AddDistributedSqlServerCache(options =>
+{
+    options.ConnectionString = "Server=.;Database=MyApp;Trusted_Connection=True;";
+    options.SchemaName = "dbo";
+    options.TableName = "ThrottlingTrollCache";
+});
+
+// 2. Register the counter store
+services.AddSingleton<ICounterStore>(provider =>
+    new DistributedCacheCounterStore(
+        provider.GetRequiredService<IDistributedCache>()
+    )
+);
+```
+
+### In-memory distributed cache (dev/test only)
+
+```csharp
+// AddDistributedMemoryCache is a single-node in-memory implementation
+// Useful for local development and testing; not suitable for multi-instance deployments
+services.AddDistributedMemoryCache();
+
+services.AddSingleton<ICounterStore>(provider =>
+    new DistributedCacheCounterStore(
+        provider.GetRequiredService<IDistributedCache>()
+    )
+);
+```
+
+## Registering via `ThrottlingTrollOptions`
+
+You can also provide the store directly when configuring the middleware:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new DistributedCacheCounterStore(
+        app.Services.GetRequiredService<IDistributedCache>()
+    );
+});
+```
+
+## How It Works Internally
+
+`IDistributedCache` does not provide atomic increment operations, so `DistributedCacheCounterStore` uses a local `SemaphoreSlim` to serialise writes within a single process. Each cache entry stores both the counter value and its expiry timestamp serialised together as a byte array (a `long` count followed by a `long` tick count), because `IDistributedCache`'s TTL cannot be read back after it is set.
+
+This means that within one instance, counter updates are consistent. However, across multiple instances each process has its own lock, so two instances can read the same counter value simultaneously and both increment it — their writes are not coordinated at the cache provider level.
+
+<Note>
+  Because `IDistributedCache` does not support atomic operations, `DistributedCacheCounterStore` is **not fully consistent** in multi-instance deployments. Instances can temporarily diverge and collectively allow slightly more requests than the configured limit. For strict per-service consistency, use [`RedisCounterStore`](/counter-stores/redis), which executes atomic Lua scripts directly on the Redis server.
+</Note>
+
+<Tip>
+  `DistributedCacheCounterStore` is a good choice when your application already depends on a specific `IDistributedCache` provider and you want to avoid introducing a direct Redis dependency. It is also useful in mixed environments where different deployments use different backing stores but share the same ThrottlingTroll configuration. For maximum throughput and strict consistency in production, prefer `RedisCounterStore`.
+</Tip>

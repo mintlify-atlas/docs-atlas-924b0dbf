@@ -1,0 +1,130 @@
+---
+title: "Azure Table Storage Counter Store for ThrottlingTroll"
+sidebarTitle: "Azure Table"
+description: "Use AzureTableCounterStore to persist ThrottlingTroll rate limit counters in Azure Table Storage, ideal for Azure-hosted .NET services."
+---
+
+`AzureTableCounterStore` persists rate limit counters in [Azure Table Storage](https://learn.microsoft.com/en-us/azure/storage/tables/table-storage-overview) (or [Cosmos DB with the Table API](https://learn.microsoft.com/en-us/azure/cosmos-db/table/introduction)). It is the easiest distributed store to set up for services already running in Azure — you only need a storage connection string and a table name. The table is created automatically if it does not exist yet, so there is no manual provisioning step.
+
+## Installation
+
+```bash
+dotnet add package ThrottlingTroll.CounterStores.AzureTable
+```
+
+## Constructors
+
+`AzureTableCounterStore` provides three constructor overloads to fit different configuration scenarios.
+
+### 1. Read connection string from environment variable (zero-config)
+
+```csharp
+public AzureTableCounterStore(string tableName = "ThrottlingTroll")
+```
+
+Reads the `AzureWebJobsStorage` environment variable as the Azure Storage connection string. This is the default connection string used by Azure Functions and Azure App Service, making this overload ideal for those hosting environments.
+
+```csharp
+services.AddSingleton<ICounterStore>(
+    new AzureTableCounterStore("ThrottlingTrollCounters")
+);
+```
+
+### 2. Provide a connection string explicitly
+
+```csharp
+public AzureTableCounterStore(string connectionString, string tableName)
+```
+
+Supply your own Azure Storage connection string directly:
+
+```csharp
+services.AddSingleton<ICounterStore>(
+    new AzureTableCounterStore(
+        "DefaultEndpointsProtocol=https;AccountName=mystorageaccount;...",
+        "ThrottlingTrollCounters"
+    )
+);
+```
+
+### 3. Provide a pre-configured `TableServiceClient`
+
+```csharp
+public AzureTableCounterStore(TableServiceClient client, string tableName = "ThrottlingTroll")
+```
+
+Pass an already-configured `TableServiceClient`. This is the preferred approach for production deployments because it lets you use Azure Managed Identity or a shared client already registered in DI:
+
+```csharp
+using Azure.Data.Tables;
+using Azure.Identity;
+using ThrottlingTroll;
+
+// Using Managed Identity — no credentials in code or config
+services.AddSingleton<ICounterStore>(
+    new AzureTableCounterStore(
+        new TableServiceClient(
+            new Uri("https://mystorageaccount.table.core.windows.net"),
+            new DefaultAzureCredential()
+        ),
+        "ThrottlingTrollCounters"
+    )
+);
+```
+
+## Table Structure
+
+The store uses a single Azure Table with the following entity shape:
+
+| Property | Azure Table column | Description |
+|---|---|---|
+| `PartitionKey` | `PartitionKey` | Sanitised counter key (hashed rule + optional identity ID) |
+| `RowKey` | `RowKey` | Same value as `PartitionKey` |
+| `Count` | `Count` | Current request count (`int64`) |
+| `ExpiresAt` | `ExpiresAt` | Absolute expiry timestamp for this counter |
+
+The table does not rely on Azure Table's native TTL. Instead, `ExpiresAt` is checked on every read and write. A background cleanup routine runs automatically every 10 minutes to delete rows that expired more than 10 minutes ago, keeping the table from growing unbounded.
+
+## Registering via `ThrottlingTrollOptions`
+
+You can also pass the store directly when configuring the middleware, without registering it in DI:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new AzureTableCounterStore(
+        "DefaultEndpointsProtocol=https;AccountName=mystorageaccount;...",
+        "ThrottlingTrollCounters"
+    );
+});
+```
+
+## Cosmos DB Table API
+
+`AzureTableCounterStore` is fully compatible with Cosmos DB for Table. Use your Cosmos DB Table API connection string in place of the Azure Storage one:
+
+```csharp
+services.AddSingleton<ICounterStore>(
+    new AzureTableCounterStore(
+        "DefaultEndpointsProtocol=https;AccountName=mycosmosaccount;...",
+        "ThrottlingTrollCounters"
+    )
+);
+```
+
+<Note>
+  Azure Table Storage uses **optimistic concurrency** and does not support native atomic increment operations. `AzureTableCounterStore` handles contention by retrying on HTTP 409 (Conflict) and HTTP 412 (Precondition Failed) responses, up to 10 times with a random back-off delay of up to 100 ms. Under very high concurrent load the retry cost can add up — for high-throughput scenarios, consider `RedisCounterStore` instead.
+
+  If you use Cosmos DB for Table, its default consistency level must be set to **Strong** or **Bounded Staleness** to avoid stale reads leading to incorrect counter values.
+</Note>
+
+<Tip>
+  In production, create your `TableServiceClient` with `DefaultAzureCredential` (or another `TokenCredential`) rather than a connection string containing a storage account key. Managed Identity eliminates the need to rotate secrets and is the recommended approach for Azure-hosted workloads:
+
+  ```csharp
+  new TableServiceClient(
+      new Uri("https://<account>.table.core.windows.net"),
+      new DefaultAzureCredential()
+  )
+  ```
+</Tip>

@@ -1,0 +1,66 @@
+---
+title: "ThrottlingTroll: Rate Limiting Middleware for .NET"
+sidebarTitle: "Introduction"
+description: "ThrottlingTroll adds ingress throttling, egress throttling, and circuit-breaking to ASP.NET Core, Azure Functions, and any .NET application."
+---
+
+ThrottlingTroll is a powerful, flexible rate limiting, throttling, and circuit-breaking library for .NET. It works as middleware in ASP.NET Core and Azure Functions (both Isolated and InProc), and since v8.0 can also be used as a standalone component in any .NET application — including console apps, worker services, and class libraries. ThrottlingTroll gives you fine-grained control over how your service accepts incoming traffic and how it calls external services, all without requiring any external infrastructure beyond an optional distributed counter store.
+
+<Note>
+  Since v8.0, ThrottlingTroll can be used in **any .NET application** — not just web projects. Instantiate `ThrottlingTroll.ThrottlingTroll` directly and wrap arbitrary code with `WithThrottlingTroll()` to apply rate limits, circuit breakers, and more.
+</Note>
+
+## Core Concepts
+
+**Ingress throttling** protects your service from overload by automatically responding with `429 TooManyRequests` when an incoming request exceeds a configured limit. It is implemented as an ASP.NET Core middleware or an Azure Functions middleware and sits in front of all your endpoints.
+
+**Egress throttling** limits the number of outbound calls your code makes to external services. Implemented as an `HttpClient` `DelegatingHandler`, it produces a local `429 TooManyRequests` response — without hitting the remote endpoint — whenever your self-imposed limit is reached. You can also configure egress throttling to automatically propagate a `429` it receives from a downstream service back to the original caller.
+
+**Circuit breaking** tracks the number of failures occurring in a time window and, once the failure threshold is crossed, opens the circuit and stops forwarding requests for a configurable trial interval. A single trial request is allowed through periodically; when it succeeds, the circuit closes again. This protects both your service and any dependency it calls from cascading failure.
+
+## Supported Rate Limiting Algorithms
+
+| Algorithm | Description |
+|-----------|-------------|
+| **FixedWindow** | No more than `PermitLimit` requests in each `IntervalInSeconds` window. Simple and efficient; may produce bursts at window boundaries. |
+| **SlidingWindow** | Like FixedWindow but divides the interval into `NumOfBuckets` sub-windows, giving a smoother request rate and ensuring a persistently misbehaving client never gets through. |
+| **LeakyBucket** | Evenly distributes allowed requests across the interval by adding a delay proportional to each request's position in the queue. Eliminates spikes entirely. |
+| **Semaphore** | Limits the number of *concurrently executing* requests to `PermitLimit`. Can act as a distributed lock when combined with RedisCounterStore and a `PermitLimit` of 1. |
+| **CircuitBreaker** | Tracks failures within `IntervalInSeconds`. When `PermitLimit` failures are exceeded, enters Trial mode and only allows one request per `TrialIntervalInSeconds` until recovery. |
+
+## Configuration Methods
+
+ThrottlingTroll supports four configuration approaches that can be combined in any order within the same application:
+
+- **Declarative** — Apply `[ThrottlingTroll]` attributes directly to controllers, Razor Pages, or Azure Function methods for maximum readability.
+- **Static** — Define rules in `appsettings.json` or `host.json` under the `ThrottlingTrollIngress` section. The simplest option for fixed limits.
+- **Programmatic** — Pass a `ThrottlingTrollConfig` at startup to set rules in code, useful when limits depend on environment variables or build-time parameters.
+- **Reactive** — Provide a `GetConfigFunc` delegate and an `IntervalToReloadConfigInSeconds` value so ThrottlingTroll periodically fetches updated rules from a database or remote config service — no restart required.
+
+## NuGet Packages
+
+| Package | Purpose |
+|---------|---------|
+| `ThrottlingTroll` | ASP.NET Core ingress/egress middleware and generic .NET usage |
+| `ThrottlingTroll.AzureFunctions` | Azure Functions (Isolated and InProc) ingress middleware |
+| `ThrottlingTroll.CounterStores.Redis` | Distributed counter store backed by Redis |
+| `ThrottlingTroll.CounterStores.AzureTable` | Distributed counter store backed by Azure Table Storage |
+| `ThrottlingTroll.CounterStores.DistributedCache` | Counter store backed by `IDistributedCache` |
+| `ThrottlingTroll.CounterStores.EfCore` | Counter store backed by Entity Framework Core |
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="ASP.NET Core Quickstart" icon="code" href="/quickstart-aspnet">
+    Add rate limiting to a Minimal API or MVC app in under 5 minutes.
+  </Card>
+  <Card title="Azure Functions Quickstart" icon="bolt" href="/quickstart-azure-functions">
+    Add rate limiting to Isolated or InProc Azure Functions projects.
+  </Card>
+  <Card title="Generic .NET Quickstart" icon="puzzle-piece" href="/quickstart-generic-dotnet">
+    Use ThrottlingTroll in console apps, workers, or any .NET code.
+  </Card>
+  <Card title="FixedWindow Algorithm" icon="clock" href="/algorithms/fixed-window">
+    Learn how the FixedWindow rate limiting algorithm works in detail.
+  </Card>
+</CardGroup>

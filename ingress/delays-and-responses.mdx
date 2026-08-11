@@ -1,0 +1,165 @@
+---
+title: "Custom Responses, Delays, and Spin-Wait Queuing for Ingress"
+sidebarTitle: "Delays & Responses"
+description: "Configure ThrottlingTroll to delay requests, queue them in a spin-wait loop, or return fully custom HTTP responses when rate limits are exceeded."
+---
+
+By default, ThrottlingTroll immediately returns `429 Too Many Requests` the moment a rate limit is exceeded. For many APIs that is exactly the right behaviour. However, there are scenarios where a softer response is preferable: absorbing a brief traffic spike by queuing requests, or returning a machine-readable JSON error body instead of plain text. This page covers both alternatives.
+
+---
+
+## Delayed responses with MaxDelayInSeconds
+
+Setting `MaxDelayInSeconds > 0` on a rule switches from hard-reject to **spin-wait** behaviour. Instead of immediately returning `429`, ThrottlingTroll polls the counter until either:
+
+1. The counter drops below the limit, at which point the request proceeds normally, or
+2. `MaxDelayInSeconds` elapses without a free slot becoming available — then it returns `429`.
+
+This is particularly effective when paired with `SemaphoreRateLimitMethod`, which tracks concurrent requests rather than requests per time window. Together they create a lightweight request queue.
+
+```csharp
+new ThrottlingTrollRule
+{
+    UriPattern = "/api/process",
+    LimitMethod = new SemaphoreRateLimitMethod
+    {
+        PermitLimit = 5,          // At most 5 concurrent executions
+        TimeoutInSeconds = 30     // Counter TTL (must be ≥ MaxDelayInSeconds)
+    },
+    MaxDelayInSeconds = 30        // Wait up to 30 s for a slot to open
+}
+```
+
+With this rule, the 6th concurrent request to `/api/process` will wait — periodically rechecking — for up to 30 seconds. If a slot frees up within that window, the request proceeds seamlessly. If not, the caller receives `429`.
+
+<Note>
+  `MaxDelayInSeconds` works with any `RateLimitMethod`, not only `SemaphoreRateLimitMethod`. For example, combining it with `FixedWindowRateLimitMethod` causes excess requests to wait until the current window resets and the counter drops back below `PermitLimit`.
+</Note>
+
+---
+
+## Custom response body with ResponseFabric
+
+`ResponseFabric` gives you complete control over the HTTP response that is sent when a limit is exceeded. It is a delegate with the following signature:
+
+```csharp
+Func<List<LimitCheckResult>, IHttpRequestProxy, IHttpResponseProxy, CancellationToken, Task>
+```
+
+| Parameter | Description |
+|---|---|
+| `List<LimitCheckResult>` | All rules that matched the current request and their check results. Entries with `RequestsRemaining < 0` are the ones that were exceeded. |
+| `IHttpRequestProxy` | Read-only view of the incoming request (URI, method, headers, query string). |
+| `IHttpResponseProxy` | Writable response object — set `StatusCode`, call `SetHttpHeader`, or write a body with `WriteAsync`. |
+| `CancellationToken` | Fires when the client disconnects before the response is sent. |
+
+### Global ResponseFabric
+
+Set it once in `ThrottlingTrollOptions` to apply to every rule that does not define its own:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+    {
+        // Pick the most restrictive exceeded rule (longest Retry-After)
+        var exceeded = checkResults
+            .Where(r => r.RequestsRemaining < 0)
+            .OrderByDescending(r => r.RetryAfterInSeconds)
+            .First();
+
+        responseProxy.StatusCode = 429;
+        responseProxy.SetHttpHeader("Retry-After", exceeded.RetryAfterHeaderValue);
+        responseProxy.SetHttpHeader("Content-Type", "application/json");
+
+        await responseProxy.WriteAsync(
+            $"{{\"error\": \"Too many requests\", \"retryAfterSeconds\": {exceeded.RetryAfterInSeconds}}}");
+    };
+
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules = [ /* ... */ ]
+    };
+});
+```
+
+### Per-rule ResponseFabric override
+
+A rule can supply its own `ResponseFabric` to return a response specific to that limit:
+
+```csharp
+new ThrottlingTrollRule
+{
+    UriPattern = "/api/search",
+    LimitMethod = new FixedWindowRateLimitMethod
+    {
+        PermitLimit = 10,
+        IntervalInSeconds = 60
+    },
+    ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+    {
+        var exceeded = checkResults
+            .Where(r => r.RequestsRemaining < 0)
+            .OrderByDescending(r => r.RetryAfterInSeconds)
+            .First();
+
+        responseProxy.StatusCode = 429;
+        responseProxy.SetHttpHeader("Retry-After", exceeded.RetryAfterHeaderValue);
+        responseProxy.SetHttpHeader("Content-Type", "application/problem+json");
+
+        await responseProxy.WriteAsync(
+            $"{{\"type\": \"https://httpstatuses.com/429\", " +
+            $"\"title\": \"Search rate limit exceeded\", " +
+            $"\"retryAfter\": {exceeded.RetryAfterInSeconds}}}");
+    }
+}
+```
+
+<Note>
+  A `ResponseFabric` defined on a rule takes precedence over the global one in `ThrottlingTrollOptions`. If neither is defined, ThrottlingTroll returns the default plain-text `429` response.
+</Note>
+
+---
+
+## Simple custom responses with ThrottlingTrollAttribute
+
+When using the declarative `[ThrottlingTroll]` attribute on controllers or Razor Pages, you can set `ResponseBody` and `ResponseStatusCode` directly on the attribute for lightweight customisation without writing a full `ResponseFabric` delegate:
+
+```csharp
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.FixedWindow,
+    PermitLimit = 20,
+    IntervalInSeconds = 60,
+    ResponseStatusCode = 429,
+    ResponseBody = "{\"error\": \"Rate limit exceeded. Please slow down.\"}")]
+[HttpPost("submit")]
+public IActionResult Submit([FromBody] SubmitRequest request) { /* ... */ }
+```
+
+`ResponseBody` and `ResponseStatusCode` on `ThrottlingTrollAttribute` internally create a `ResponseFabric` delegate, so they override the global `ThrottlingTrollOptions.ResponseFabric` for that rule.
+
+---
+
+## Letting throttled requests continue normally
+
+In some cases you may want to observe that a limit was exceeded (for logging, headers, or analytics) but still serve the request. Set `ShouldContinueAsNormal = true` on the `IIngressHttpResponseProxy` inside your `ResponseFabric`:
+
+```csharp
+options.ResponseFabric = async (checkResults, requestProxy, responseProxy, cancellationToken) =>
+{
+    var exceeded = checkResults.FirstOrDefault(r => r.RequestsRemaining < 0);
+
+    if (exceeded != null)
+    {
+        // Add a warning header but let the request through
+        responseProxy.SetHttpHeader("X-RateLimit-Warning", "Limit exceeded — request served anyway");
+        ((IIngressHttpResponseProxy)responseProxy).ShouldContinueAsNormal = true;
+    }
+
+    await Task.CompletedTask;
+};
+```
+
+<Tip>
+  `ShouldContinueAsNormal` is available on `IIngressHttpResponseProxy` (the ingress-specific interface). This pattern is useful for gradual rollouts — you can monitor how often limits would fire before switching to hard enforcement.
+</Tip>

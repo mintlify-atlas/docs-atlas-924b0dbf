@@ -1,0 +1,94 @@
+---
+title: "Fixed Window Rate Limiting Algorithm in ThrottlingTroll"
+sidebarTitle: "Fixed Window"
+description: "FixedWindowRateLimitMethod allows at most PermitLimit requests per IntervalInSeconds window. Simple, low-overhead, but susceptible to burst traffic at window boundaries."
+---
+
+The Fixed Window algorithm is the simplest rate limiting strategy available in ThrottlingTroll. Time is divided into discrete, non-overlapping windows of `IntervalInSeconds` length. Each incoming request increments a counter for the current window, and if that counter exceeds `PermitLimit`, the request is rejected with `429 TooManyRequests`. When the window rolls over, the counter resets to zero and traffic is permitted again. Because the counter is a single integer keyed on the current window boundary, Fixed Window has the lowest storage and computation overhead of any algorithm in ThrottlingTroll — one counter read plus one atomic increment per request.
+
+The trade-off is that the window boundary creates a seam. A client can send `PermitLimit` requests at the very end of one window and another `PermitLimit` requests at the very start of the next window, resulting in a burst of up to **2× PermitLimit** requests in a very short period. If that burst is acceptable for your workload, Fixed Window is the right choice. If it is not, consider [Sliding Window](/algorithms/sliding-window) instead.
+
+## Class
+
+`FixedWindowRateLimitMethod`
+
+## Properties
+
+<ParamField path="PermitLimit" type="int" required>
+  The maximum number of requests allowed within a single window. Every request (or a request weighted by a `CostExtractor`) increments the counter by its cost; once the counter exceeds `PermitLimit` the rule trips and subsequent requests receive `429` until the window expires.
+</ParamField>
+
+<ParamField path="IntervalInSeconds" type="double" required>
+  The size of the time window in seconds. Fractional values are supported — for example, `0.1` creates a 100 ms window (10 RPS limit when `PermitLimit = 1`). The counter's TTL is set to the start of the next window, so it resets automatically without any background job.
+</ParamField>
+
+<ParamField path="ShouldThrowOnFailures" type="bool" default="false">
+  Controls how ThrottlingTroll handles internal errors (e.g., a Redis timeout while reading the counter). When `false` (the default), the error is logged and the request is allowed to proceed. When `true`, the exception is rethrown and the request fails. Use `true` when enforcing the limit is more important than availability.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="false">
+  When `false` (the default), any request that matches an entry in `ThrottlingTrollConfig.AllowList` is exempt from this rule. Set to `true` to apply the rule unconditionally, even to allowlisted identities.
+</ParamField>
+
+<ParamField path="RetryAfterInSeconds" type="int" readonly>
+  Computed as `Math.Ceiling(IntervalInSeconds)`. ThrottlingTroll inserts this value into the `Retry-After` response header so clients know how long to wait before retrying. You do not set this property directly.
+</ParamField>
+
+## Usage
+
+### Programmatic configuration
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/data",
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = 100,
+                    IntervalInSeconds = 60
+                }
+            }
+        ]
+    };
+});
+```
+
+### Attribute (declarative) configuration
+
+```csharp
+[ThrottlingTroll(Algorithm = RateLimitAlgorithm.FixedWindow, PermitLimit = 100, IntervalInSeconds = 60)]
+public IActionResult GetData() => Ok();
+```
+
+### appsettings.json configuration
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/data",
+        "RateLimit": {
+          "Algorithm": "FixedWindow",
+          "PermitLimit": 100,
+          "IntervalInSeconds": 60
+        }
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  **Boundary burst risk.** At the junction of two consecutive windows, a client can successfully send up to **2× PermitLimit** requests — `PermitLimit` at the tail end of the expiring window and another `PermitLimit` at the start of the fresh window. If your downstream systems cannot tolerate this burst, switch to [Sliding Window](/algorithms/sliding-window), which spreads the count across sub-buckets and eliminates the seam.
+</Note>
+
+<Tip>
+  Sub-second windows are fully supported. Set `IntervalInSeconds = 0.1` to cap traffic at 10 RPS when `PermitLimit = 1`, or `IntervalInSeconds = 1` with `PermitLimit = 50` for a 50 RPS limit with a per-second reset. The window TTL is calculated with millisecond precision.
+</Tip>

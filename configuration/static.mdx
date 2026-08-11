@@ -1,0 +1,224 @@
+---
+title: "Static Configuration via appsettings.json and host.json"
+sidebarTitle: "Static Config"
+description: "Configure ThrottlingTroll rules statically in appsettings.json for ASP.NET or host.json for Azure Functions, with no code changes required."
+---
+
+Static configuration lets you define rate limiting rules entirely in your application's configuration file, with no C# code changes required. At startup ThrottlingTroll reads from `IConfiguration` using a well-known section name — `ThrottlingTrollIngress` for ingress rules and `ThrottlingTrollEgress` for egress rules in ASP.NET projects, or `AzureFunctionsJobHost:extensions:throttlingTroll:throttlingTrollIngress` in Azure Functions In-Process apps. Any change to the configuration file takes effect on the next service restart unless you also enable [reactive (hot-reload) configuration](/configuration/reactive).
+
+## Section names
+
+| Host | Ingress section | Egress section |
+|---|---|---|
+| ASP.NET / .NET Generic Host | `ThrottlingTrollIngress` | `ThrottlingTrollEgress` |
+| Azure Functions In-Process | `AzureFunctionsJobHost:extensions:throttlingTroll:throttlingTrollIngress` | `AzureFunctionsJobHost:extensions:throttlingTroll:throttlingTrollEgress` |
+
+You can override the section name at startup using `ThrottlingTrollOptions.ConfigSectionName` — see [Programmatic Configuration](/configuration/programmatic) for details.
+
+## appsettings.json structure
+
+The top-level section contains three optional fields: `UniqueName`, `Rules`, and `AllowList`.
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "UniqueName": "MyService",
+    "Rules": [
+      {
+        "UriPattern": "/api/orders",
+        "Method": "GET",
+        "RateLimit": {
+          "Algorithm": "FixedWindow",
+          "PermitLimit": 100,
+          "IntervalInSeconds": 60
+        }
+      },
+      {
+        "RateLimit": {
+          "Algorithm": "SlidingWindow",
+          "PermitLimit": 1000,
+          "IntervalInSeconds": 60,
+          "NumOfBuckets": 6
+        }
+      }
+    ],
+    "AllowList": [
+      {
+        "UriPattern": "/health"
+      },
+      {
+        "UriPattern": "/metrics"
+      }
+    ]
+  }
+}
+```
+
+## Rule filters
+
+Each entry in `Rules` corresponds to a `ThrottlingTrollRule`. The filter fields control which requests the rule matches:
+
+| Field | Type | Description |
+|---|---|---|
+| `UriPattern` | string | Regex pattern matched against the full request URI. Empty or omitted means any URI. |
+| `UriString` | string | Case-insensitive substring match against the request URI. Overshadowed by `UriPattern` when both are set. |
+| `Method` | string | Comma-separated HTTP methods, e.g. `"GET,POST"`. Empty or omitted means any method. |
+| `HeaderName` | string | HTTP header that must be present. When `HeaderValue` is also set, the header must equal that value. |
+| `HeaderValue` | string | Exact value for the header named by `HeaderName`. |
+| `HeaderValuePattern` | string | Regex for the header named by `HeaderName`. Overshadows `HeaderValue` when both are set. |
+| `IdentityId` | string | Matches requests whose extracted identity equals this value. Requires a global `IdentityIdExtractor` to be configured in `ThrottlingTrollOptions`. |
+
+## RateLimit algorithms and their fields
+
+The `RateLimit` object inside each rule uses `Algorithm` (a string) to select the algorithm. The remaining fields depend on which algorithm you choose:
+
+### FixedWindow
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "FixedWindow",
+    "PermitLimit": 100,
+    "IntervalInSeconds": 60
+  }
+}
+```
+
+Allows up to `PermitLimit` requests per `IntervalInSeconds` window. See [Fixed Window](/algorithms/fixed-window).
+
+### SlidingWindow
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "SlidingWindow",
+    "PermitLimit": 100,
+    "IntervalInSeconds": 60,
+    "NumOfBuckets": 6
+  }
+}
+```
+
+Divides the window into `NumOfBuckets` sub-buckets and maintains a rolling count. `NumOfBuckets` must be greater than 1. See [Sliding Window](/algorithms/sliding-window).
+
+### LeakyBucket
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "LeakyBucket",
+    "PermitLimit": 100,
+    "IntervalInSeconds": 60
+  }
+}
+```
+
+Queues requests and processes them at a steady rate of `PermitLimit / IntervalInSeconds` per second. Requests that would overflow the queue receive `429`. See [Leaky Bucket](/algorithms/leaky-bucket).
+
+### Semaphore
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "Semaphore",
+    "PermitLimit": 5,
+    "TimeoutInSeconds": 30
+  }
+}
+```
+
+Limits the number of **concurrent** requests to `PermitLimit`. When all slots are occupied, incoming requests wait up to `TimeoutInSeconds` before being rejected. Omitting `TimeoutInSeconds` defaults to `100`. See [Semaphore](/algorithms/semaphore).
+
+To implement request deduplication, add `ReleaseAfterSeconds`:
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "Semaphore",
+    "PermitLimit": 1,
+    "TimeoutInSeconds": 10,
+    "ReleaseAfterSeconds": 30
+  }
+}
+```
+
+### CircuitBreaker
+
+```json
+{
+  "RateLimit": {
+    "Algorithm": "CircuitBreaker",
+    "PermitLimit": 5,
+    "IntervalInSeconds": 10,
+    "TrialIntervalInSeconds": 30
+  }
+}
+```
+
+Monitors failure rates. When more than `PermitLimit` failures occur within `IntervalInSeconds`, the circuit opens and allows only one trial request every `TrialIntervalInSeconds` seconds. See [Circuit Breaker](/algorithms/circuit-breaker).
+
+## Common optional fields on every rule
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MaxDelayInSeconds` | int | `0` | When positive, spin-wait up to this many seconds instead of immediately returning `429`. |
+| `Name` | string | _(hash)_ | Rule name for telemetry / distributed traces. |
+| `RateLimit.ErrorHandlingBehavior` | string | `"Unspecified"` | `"LogAndContinue"` or `"ThrowExceptions"` — how internal counter-store errors are handled. |
+| `RateLimit.IgnoreAllowList` | bool | `false` | When `true`, the rule fires even for requests that match an `AllowList` entry. |
+
+## UniqueName
+
+`UniqueName` is an optional string that is prepended to every counter cache key generated by the rules in this configuration. Its purpose is to avoid counter collisions when multiple services share the same distributed counter store (e.g., the same Redis instance).
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "UniqueName": "payments-service",
+    "Rules": [...]
+  }
+}
+```
+
+If two services share a Redis instance but both have a rule that matches `/api/orders` with the same `PermitLimit`, without `UniqueName` they would share the **same** counter and effectively pool their quotas. Setting `UniqueName` to a distinct string per service keeps their counters isolated.
+
+<Note>
+  If `UniqueName` changes (for example during a deployment), all existing counters under the old prefix are abandoned — they remain in the store until they expire naturally, but are no longer incremented or checked. New counters are created under the new prefix. This can cause a brief quota reset after a rename.
+</Note>
+
+## AllowList
+
+Any request that matches at least one entry in `AllowList` is exempted from **all** rules and passes through without being counted. `AllowList` entries use the same filter fields as rules (`UriPattern`, `UriString`, `Method`, `HeaderName`, `HeaderValue`, `HeaderValuePattern`, `IdentityId`) but have no `RateLimit` section.
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [...],
+    "AllowList": [
+      { "UriPattern": "/health" },
+      { "UriPattern": "/ready" },
+      { "HeaderName": "X-Internal-Token", "HeaderValue": "my-secret" }
+    ]
+  }
+}
+```
+
+A rule can opt out of the allow list by setting `IgnoreAllowList: true` in its `RateLimit` block. The `CircuitBreaker` algorithm does this by default.
+
+## Overriding the configuration section name
+
+If `ThrottlingTrollIngress` conflicts with an existing configuration key, or if you want to load ingress and egress rules from custom sections, override `ConfigSectionName` in startup code:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.ConfigSectionName = "RateLimiting:IngressRules";
+});
+```
+
+<Note>
+  The `RateLimit` block in JSON uses `RateLimitMethodSettings` for deserialization. This is different from programmatic configuration, where you assign a concrete `RateLimitMethod` subclass directly to `ThrottlingTrollRule.LimitMethod`. In JSON the algorithm is selected by the `"Algorithm"` string field and the correct subclass is instantiated automatically.
+</Note>
+
+<Tip>
+  Static configuration in `appsettings.json` and [declarative `[ThrottlingTroll]` attributes](/configuration/declarative) are merged together automatically at startup. You can freely combine them — for example, use `appsettings.json` for coarse global limits and attributes for fine-grained per-endpoint limits.
+</Tip>

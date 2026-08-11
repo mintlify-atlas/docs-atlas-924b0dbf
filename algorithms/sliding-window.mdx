@@ -1,0 +1,96 @@
+---
+title: "Sliding Window Rate Limiting Algorithm in ThrottlingTroll"
+sidebarTitle: "Sliding Window"
+description: "SlidingWindowRateLimitMethod divides the time window into NumOfBuckets sub-windows for smoother rate limiting that prevents boundary bursts."
+---
+
+The Sliding Window algorithm solves the boundary burst problem inherent in [Fixed Window](/algorithms/fixed-window) by dividing the full `IntervalInSeconds` window into `NumOfBuckets` equally sized sub-windows (buckets). Each bucket holds a separate counter in the counter store. On every request, ThrottlingTroll increments the counter for the current bucket and reads all other buckets in parallel, then sums them. If the total count across all buckets exceeds `PermitLimit`, the request is rejected with `429 TooManyRequests`.
+
+Because the bucket boundaries roll forward continuously — old buckets expire and new ones open — there is never a moment where the full `PermitLimit` from an old period plus the full `PermitLimit` of the new period become simultaneously available. A client that persistently hammers the endpoint beyond the limit will find every single request rejected; there is no "window reset escape hatch". This makes Sliding Window the right default when you need a smooth, predictable request rate.
+
+## Class
+
+`SlidingWindowRateLimitMethod`
+
+## Properties
+
+<ParamField path="PermitLimit" type="int" required>
+  The maximum number of requests allowed across all buckets combined within the full `IntervalInSeconds` window. If the sum of all bucket counters exceeds this value, the incoming request receives `429 TooManyRequests`.
+</ParamField>
+
+<ParamField path="IntervalInSeconds" type="double" required>
+  The total window size in seconds. ThrottlingTroll divides this evenly by `NumOfBuckets` to compute each bucket's duration. Fractional values are supported.
+</ParamField>
+
+<ParamField path="NumOfBuckets" type="int" required>
+  The number of equal sub-windows to divide the interval into. More buckets produce a smoother effective rate but increase counter store operations — each request triggers one `IncrementAndGet` plus `NumOfBuckets - 1` parallel `Get` calls. A value between **6 and 12** is a good starting point; go higher only if your workload requires it and your counter store can handle the load.
+</ParamField>
+
+<ParamField path="RetryAfterInSeconds" type="int" readonly>
+  Computed as `Math.Ceiling(IntervalInSeconds / NumOfBuckets)` — the duration of a single bucket, rounded up. This is the minimum time a client must wait before the oldest full bucket expires and capacity becomes available again. ThrottlingTroll writes this value into the `Retry-After` response header automatically.
+</ParamField>
+
+## Usage
+
+### Programmatic configuration
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                UriPattern = "/api/search",
+                LimitMethod = new SlidingWindowRateLimitMethod
+                {
+                    PermitLimit = 100,
+                    IntervalInSeconds = 60,
+                    NumOfBuckets = 6  // 10-second buckets
+                }
+            }
+        ]
+    };
+});
+```
+
+### Attribute (declarative) configuration
+
+```csharp
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.SlidingWindow,
+    PermitLimit = 100,
+    IntervalInSeconds = 60,
+    NumOfBuckets = 6)]
+public IActionResult Search([FromQuery] string q) => Ok();
+```
+
+### appsettings.json configuration
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/search",
+        "RateLimit": {
+          "Algorithm": "SlidingWindow",
+          "PermitLimit": 100,
+          "IntervalInSeconds": 60,
+          "NumOfBuckets": 6
+        }
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  **Counter store overhead.** Each request issues one atomic `IncrementAndGet` on the current bucket plus one `Get` per remaining bucket, all fired in parallel. With `NumOfBuckets = 6` that is 6 round-trips to your counter store per request. With an in-process `MemoryCacheCounterStore` this is negligible; with a remote Redis instance, keep `NumOfBuckets` reasonable and ensure your Redis connection is low-latency.
+</Note>
+
+<Tip>
+  Unlike Fixed Window, a client that continuously exceeds `PermitLimit` will receive `429` on every request and **never** get a valid response — not even at a "window reset". This is intentional: Sliding Window is designed to deny sustained abusers rather than reward them at each boundary. If periodic resets are acceptable or even desirable in your use case, Fixed Window has lower overhead.
+</Tip>

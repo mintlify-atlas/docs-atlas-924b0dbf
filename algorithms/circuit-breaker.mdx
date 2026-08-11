@@ -1,0 +1,180 @@
+---
+title: "Circuit Breaker Pattern in ThrottlingTroll"
+sidebarTitle: "Circuit Breaker"
+description: "CircuitBreakerRateLimitMethod tracks failure rates and trips open when PermitLimit failures occur in IntervalInSeconds, then tests recovery via a trial interval."
+---
+
+The Circuit Breaker algorithm protects your service and its downstream dependencies from cascading failures. Instead of counting all requests, it counts only **failures** — exceptions thrown during request processing, and HTTP responses outside the `200–299` range. When the number of failures within an `IntervalInSeconds` window reaches `PermitLimit`, the circuit trips open and all subsequent requests are immediately rejected with `429 TooManyRequests`, sparing the failing downstream system from further load. Periodically, one trial request is allowed through; if it succeeds, the circuit closes and normal traffic resumes.
+
+Unlike the other ThrottlingTroll algorithms, CircuitBreaker state is tracked **per-instance** using an in-process `MemoryCacheCounterStore`. This means each replica of your service independently decides when to open and close the circuit, which is intentional — a failure visible to one instance may not yet be visible to another, and coordinating circuit state across a distributed cluster adds complexity without meaningful benefit for most failure scenarios.
+
+## State machine
+
+The circuit moves through three states:
+
+1. **Closed** *(normal operation)*: all requests pass through. Each failure increments the failure counter. As long as the counter stays below `PermitLimit` within `IntervalInSeconds`, the circuit remains closed.
+
+2. **Open** *(tripped)*: `PermitLimit` failures occurred within `IntervalInSeconds`. All requests are immediately rejected with `429 TooManyRequests`. No further load reaches the downstream dependency.
+
+3. **Trial** *(half-open)*: one request per `TrialIntervalInSeconds` is allowed through as a health probe. If the trial request succeeds, the circuit transitions back to **Closed**. If it fails, the circuit remains in **Trial** and the next probe is scheduled `TrialIntervalInSeconds` later.
+
+## Class
+
+`CircuitBreakerRateLimitMethod`
+
+## Properties
+
+<ParamField path="PermitLimit" type="int" required>
+  The number of failures that must occur within `IntervalInSeconds` to trip the circuit open. A "failure" is any request that throws an exception or returns an HTTP status code outside `200–299`. Once the count of failures reaches this value, the circuit opens immediately.
+</ParamField>
+
+<ParamField path="IntervalInSeconds" type="double" required>
+  The sliding window in which failures are counted. Failures older than `IntervalInSeconds` age out and no longer contribute to the failure count. If the failure rate drops below `PermitLimit` within the window, the circuit does not open (though it may already be open from a previous burst of failures).
+</ParamField>
+
+<ParamField path="TrialIntervalInSeconds" type="double" default="100">
+  How frequently to allow a single trial request through when the circuit is open. One request per `TrialIntervalInSeconds` acts as a health probe. If that request succeeds, the circuit closes. If it fails, the probe timer resets and another trial is permitted after another `TrialIntervalInSeconds` seconds.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="true">
+  Unlike other algorithms where `IgnoreAllowList` defaults to `false`, CircuitBreaker defaults to `true`. The circuit breaker must track failures from all callers — including allowlisted ones — to make an accurate assessment of downstream health. Exempting allowlisted callers from failure tracking could mask a real outage.
+</ParamField>
+
+<ParamField path="RetryAfterInSeconds" type="int" readonly>
+  Computed as `Math.Ceiling(IntervalInSeconds)`. Written into the `Retry-After` response header for requests rejected while the circuit is open. This is a conservative hint; in practice the circuit may close sooner if a trial request succeeds.
+</ParamField>
+
+## Customising failure detection
+
+By default, any thrown exception or any HTTP status code outside `200–299` is counted as a failure. You can override this by subclassing `CircuitBreakerRateLimitMethod` and overriding `IsFailed`:
+
+```csharp
+public class PaymentServiceCircuitBreaker : CircuitBreakerRateLimitMethod
+{
+    protected internal override bool IsFailed(IHttpResponseProxy response, Exception exception)
+    {
+        // Only count server errors, not client errors
+        if (exception != null) return true;
+        return response?.StatusCode >= 500;
+    }
+}
+```
+
+The method receives the response proxy (or `null` if an exception was thrown) and the exception (or `null` if the request completed without throwing). Return `true` to count the outcome as a failure; `false` to treat it as a success.
+
+## Usage
+
+### Egress circuit breaker (protecting outbound HTTP calls)
+
+```csharp
+services.AddHttpClient("PaymentService", client =>
+{
+    client.BaseAddress = new Uri("https://payments.example.com");
+})
+.AddThrottlingTrollMessageHandler(options =>
+{
+    options.Config = new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "PaymentService circuit breaker",
+                LimitMethod = new CircuitBreakerRateLimitMethod
+                {
+                    PermitLimit = 5,            // Trip after 5 failures
+                    IntervalInSeconds = 30,     // Within a 30-second window
+                    TrialIntervalInSeconds = 10 // Allow a probe every 10 seconds
+                }
+            }
+        ]
+    };
+});
+```
+
+### Standalone usage in a console application
+
+```csharp
+using ThrottlingTroll;
+
+var throttler = new ThrottlingTroll.ThrottlingTroll(
+    new ThrottlingTrollConfig
+    {
+        Rules =
+        [
+            new ThrottlingTrollRule
+            {
+                Name = "PaymentService circuit breaker",
+                LimitMethod = new CircuitBreakerRateLimitMethod
+                {
+                    PermitLimit = 5,           // Trip after 5 failures
+                    IntervalInSeconds = 30,    // Within a 30-second window
+                    TrialIntervalInSeconds = 10 // Try again every 10 seconds
+                }
+            }
+        ]
+    }
+);
+
+await throttler.WithThrottlingTroll(
+    async ctx =>
+    {
+        // Call payment service — exceptions and non-2xx responses count as failures
+        var response = await httpClient.PostAsync("/pay", content);
+        response.EnsureSuccessStatusCode();
+    },
+    async ctx =>
+    {
+        var rule = ctx.ExceededLimit.Rule;
+        var trialInterval = ((CircuitBreakerRateLimitMethod)rule.LimitMethod).TrialIntervalInSeconds;
+        Console.WriteLine($"Circuit open for '{rule.Name}'. Retry in {trialInterval}s");
+    }
+);
+```
+
+### Attribute (declarative) configuration
+
+```csharp
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.CircuitBreaker,
+    PermitLimit = 5,
+    IntervalInSeconds = 30,
+    TrialIntervalInSeconds = 10)]
+public async Task<IActionResult> ChargeCard([FromBody] PaymentRequest request)
+{
+    await _paymentGateway.ChargeAsync(request);
+    return Ok();
+}
+```
+
+### appsettings.json configuration
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/charge",
+        "RateLimit": {
+          "Algorithm": "CircuitBreaker",
+          "PermitLimit": 5,
+          "IntervalInSeconds": 30,
+          "TrialIntervalInSeconds": 10
+        }
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  **Circuit breaker state is per-instance, not distributed.** Even when you configure a distributed `RedisCounterStore` for your other rules, `CircuitBreakerRateLimitMethod` always uses its own internal `MemoryCacheCounterStore`. Failure counts and circuit state are local to each running instance of your service. In a multi-instance deployment, different replicas may have their circuits in different states at the same time. This is by design: each replica independently observes failures in the requests it handles and protects itself accordingly.
+</Note>
+
+<Warning>
+  **`IgnoreAllowList` defaults to `true` for CircuitBreaker.** Requests that match an entry in `ThrottlingTrollConfig.AllowList` are normally exempt from rate limiting rules. For CircuitBreaker, this exemption is disabled by default so that all requests — including allowlisted ones — contribute to the failure counter. If allowlisted callers were excluded from failure tracking, a downstream outage that only manifests for those callers would go undetected and the circuit would never open.
+</Warning>
+
+<Tip>
+  **Combine CircuitBreaker with egress throttling for maximum resilience.** Apply a `FixedWindowRateLimitMethod` or `LeakyBucketRateLimitMethod` rule on your `HttpClient` egress handler to respect a downstream API's rate quota, and stack a `CircuitBreakerRateLimitMethod` rule on the same handler to cut traffic entirely when that API starts returning errors. The two rules are evaluated independently — ThrottlingTroll applies the first rule that trips, whichever it is.
+</Tip>

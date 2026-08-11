@@ -1,0 +1,157 @@
+---
+title: "Get Started with ThrottlingTroll in ASP.NET Core"
+sidebarTitle: "ASP.NET Core"
+description: "Install ThrottlingTroll and add rate limiting to an ASP.NET Core Minimal API or MVC app in under 5 minutes."
+---
+
+This guide walks you through adding rate limiting to an ASP.NET Core application using ThrottlingTroll. Whether you are building a Minimal API or a classic MVC app, you will be returning `429 TooManyRequests` to clients who exceed your configured limits within just a few minutes of setup.
+
+<Steps>
+
+  <Step title="Install the NuGet package">
+    Add ThrottlingTroll to your project with the .NET CLI:
+
+    ```bash
+    dotnet add package ThrottlingTroll
+    ```
+  </Step>
+
+  <Step title="Register the middleware">
+    Call `app.UseThrottlingTroll()` in `Program.cs` **after** `builder.Build()`. ThrottlingTroll is a standard ASP.NET Core middleware, so placement matters — add it before your route mappings so that it intercepts every request.
+
+    ```csharp
+    var builder = WebApplication.CreateBuilder(args);
+    var app = builder.Build();
+
+    app.UseThrottlingTroll();
+
+    app.MapGet("/api/data", () => Results.Ok("Hello!"));
+
+    app.Run();
+    ```
+
+    With no options provided, ThrottlingTroll reads its configuration from the `ThrottlingTrollIngress` section of `appsettings.json` and also scans your assembly for `[ThrottlingTroll]` attributes automatically.
+  </Step>
+
+  <Step title="Configure a rate limiting rule">
+    Pass an options delegate to `UseThrottlingTroll` to configure rules programmatically. The example below limits `/api/data` to **10 requests per 10 seconds** using the FixedWindow algorithm:
+
+    ```csharp
+    using ThrottlingTroll;
+
+    var builder = WebApplication.CreateBuilder(args);
+    var app = builder.Build();
+
+    app.MapGet("/api/data", () => Results.Ok("Hello!"));
+
+    app.UseThrottlingTroll(options =>
+    {
+        options.Config = new ThrottlingTrollConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "/api/data",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = 10,
+                        IntervalInSeconds = 10
+                    }
+                }
+            ]
+        };
+    });
+
+    app.Run();
+    ```
+
+    `UriPattern` is matched as a regular expression against the request path, so you can use patterns like `/api/.*` to cover an entire route prefix.
+  </Step>
+
+  <Step title="Test the limit">
+    Start the application and send more than 10 requests to `/api/data` within a 10-second window. Requests that exceed the limit receive:
+
+    - **HTTP 429 TooManyRequests**
+    - A `Retry-After` response header indicating how many seconds the client should wait before retrying
+
+    All successful requests receive the normal `200 OK` response. The first 10 requests in every 10-second window pass through without interference.
+  </Step>
+
+</Steps>
+
+## Declarative Configuration with Attributes
+
+For MVC controllers and Razor Pages, you can apply rate limiting directly with the `[ThrottlingTroll]` attribute instead of writing programmatic rules. ThrottlingTroll scans your assembly at startup and automatically registers the rules it finds.
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using ThrottlingTroll;
+
+[ApiController]
+[Route("api/[controller]")]
+public class DataController : ControllerBase
+{
+    // Limit this endpoint to 5 requests per 30 seconds
+    [ThrottlingTroll(Algorithm = RateLimitMethod.FixedWindow, PermitLimit = 5, IntervalInSeconds = 30)]
+    [HttpGet]
+    public IActionResult Get()
+    {
+        return Ok("Hello!");
+    }
+}
+```
+
+Attributes can be applied at the controller level (to cover all actions) or at the individual action level. Both are picked up automatically when `UseThrottlingTroll()` is registered in `Program.cs`.
+
+## Static Configuration via appsettings.json
+
+Prefer keeping limits out of code? Define the `ThrottlingTrollIngress` section in `appsettings.json`:
+
+```json
+{
+  "ThrottlingTrollIngress": {
+    "Rules": [
+      {
+        "UriPattern": "/api/data",
+        "LimitMethod": {
+          "Type": "FixedWindow",
+          "PermitLimit": 10,
+          "IntervalInSeconds": 10
+        }
+      }
+    ]
+  }
+}
+```
+
+ThrottlingTroll reads this section automatically when middleware is registered, with no additional options needed.
+
+<Tip>
+  In a multi-instance deployment (e.g., multiple pods in Kubernetes or multiple App Service instances), each instance tracks its own in-memory counters by default. To enforce a **global** rate limit across all instances, configure a distributed counter store such as Redis:
+
+  ```bash
+  dotnet add package ThrottlingTroll.CounterStores.Redis
+  ```
+
+  Then pass it when registering the middleware:
+
+  ```csharp
+  app.UseThrottlingTroll(options =>
+  {
+      options.CounterStore = new RedisCounterStore(
+          ConnectionMultiplexer.Connect("your-redis-connection-string")
+      );
+      // ... your rules
+  });
+  ```
+
+  See the [Counter Stores overview](/counter-stores/overview) for all available backends, including Azure Table Storage, `IDistributedCache`, and Entity Framework Core.
+</Tip>
+
+## Next Steps
+
+- [Declarative configuration with attributes](/configuration/declarative) — Full attribute reference and advanced patterns
+- [Counter Stores overview](/counter-stores/overview) — Make rate limits consistent across multiple service instances
+- [Personalized rate limiting](/ingress/identity-and-cost) — Limit clients individually by IP, API key, claim, or any request property
+- [Custom responses and delays](/ingress/delays-and-responses) — Return custom payloads or delay requests instead of rejecting them

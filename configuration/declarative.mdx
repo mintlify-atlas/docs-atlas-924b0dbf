@@ -1,0 +1,198 @@
+---
+title: "Declarative Rate Limiting with ThrottlingTrollAttribute"
+sidebarTitle: "Declarative"
+description: "Apply rate limits directly to ASP.NET controllers and Razor Pages using the [ThrottlingTroll] attribute for the most readable configuration."
+---
+
+The `[ThrottlingTroll]` attribute is the most concise way to define rate limiting rules in an ASP.NET application. You place it directly on a controller class, an action method, or a Razor Page model and ThrottlingTroll automatically infers the route pattern from your routing attributes — no extra configuration files or startup code required. The attribute is discovered at startup by scanning the assemblies listed in `ThrottlingTrollOptions.Assemblies` and is merged with any static or programmatic configuration you may also have.
+
+## Attribute properties
+
+<ParamField path="Algorithm" type="RateLimitAlgorithm" required>
+  The rate limiting algorithm to apply. One of:
+  - `RateLimitAlgorithm.FixedWindow` — fixed time window counter
+  - `RateLimitAlgorithm.SlidingWindow` — rolling window counter divided into buckets
+  - `RateLimitAlgorithm.LeakyBucket` — queue-based smoothing with built-in delay
+  - `RateLimitAlgorithm.Semaphore` — concurrent-request limiter (concurrency cap)
+  - `RateLimitAlgorithm.CircuitBreaker` — failure-rate-based circuit breaker
+</ParamField>
+
+<ParamField path="PermitLimit" type="int" required>
+  The maximum number of requests (or units of cost) allowed within the configured window. Applies to every algorithm.
+</ParamField>
+
+<ParamField path="IntervalInSeconds" type="double">
+  The size of the time window in seconds. Required for `FixedWindow`, `SlidingWindow`, `LeakyBucket`, and `CircuitBreaker`. Supports fractions (e.g., `0.5` for a 500 ms window).
+</ParamField>
+
+<ParamField path="NumOfBuckets" type="int">
+  Number of sub-buckets to divide the sliding window into. Required for `SlidingWindow` and must be greater than 1. A higher value gives a smoother limit at the cost of more counter-store entries.
+</ParamField>
+
+<ParamField path="TrialIntervalInSeconds" type="double">
+  `CircuitBreaker` only. How frequently (in seconds) the circuit allows a single trial request through once the failure threshold has been exceeded. Defaults to `100`.
+</ParamField>
+
+<ParamField path="TimeoutInSeconds" type="double" default="100">
+  `Semaphore` only. Maximum number of seconds a request waits before being rejected when all semaphore slots are occupied.
+</ParamField>
+
+<ParamField path="ReleaseAfterSeconds" type="double">
+  `Semaphore` only. When set to a positive value, the occupied semaphore slot is released this many seconds after the request completes rather than immediately. Useful for implementing request deduplication — subsequent identical requests are blocked for the duration.
+</ParamField>
+
+<ParamField path="MaxDelayInSeconds" type="int" default="0">
+  When greater than `0`, ThrottlingTroll will spin-wait (re-check the counter periodically) for up to this many seconds instead of immediately returning `429`. Useful for smoothing bursty traffic or implementing critical sections. See [Delays and Responses](/ingress/delays-and-responses) for details.
+</ParamField>
+
+<ParamField path="Name" type="string">
+  A human-readable label for the rule. Used exclusively for telemetry — this name appears as the OpenTelemetry span name in distributed traces. If omitted, a hash of the rule's parameters is used.
+</ParamField>
+
+<ParamField path="UriPattern" type="string">
+  A regex pattern to match the request URI against. ThrottlingTroll automatically infers the URI pattern from your `[Route]` and `[HttpGet]`/`[HttpPost]`/… attributes, so you only need to set this property when the auto-inferred pattern is incorrect or when you want to widen/narrow the match.
+</ParamField>
+
+<ParamField path="Method" type="string">
+  Comma-separated HTTP methods this rule applies to, e.g. `"GET,POST"`. When empty or `null`, the rule matches any method. ThrottlingTroll auto-populates this from `[HttpGet]`, `[HttpPost]`, etc., so you rarely need to set it on an attribute applied to a method.
+</ParamField>
+
+<ParamField path="HeaderName" type="string">
+  An HTTP request header to inspect. When set, the rule only fires for requests that include this header. If `HeaderValue` is also set, the header must equal that value exactly. If `HeaderValue` is omitted, any non-empty header value matches.
+</ParamField>
+
+<ParamField path="HeaderValue" type="string">
+  The exact value the header named by `HeaderName` must have for the rule to fire. Ignored when `HeaderName` is not set.
+</ParamField>
+
+<ParamField path="IdentityId" type="string">
+  When set, the rule only applies to requests whose extracted identity (as determined by `IdentityIdExtractor`) matches this value. Useful for applying a per-client limit at the attribute level.
+</ParamField>
+
+<ParamField path="ResponseBody" type="string">
+  Custom response body to send when the limit is exceeded. Overrides `ThrottlingTrollOptions.ResponseFabric`. Defaults to `"Too many requests"` when `ResponseStatusCode` is set but this property is left empty.
+</ParamField>
+
+<ParamField path="ResponseStatusCode" type="int" default="429">
+  HTTP status code to return when the limit is exceeded. Overrides `ThrottlingTrollOptions.ResponseFabric`. Defaults to `429` when `ResponseBody` is set but this property is `0`.
+</ParamField>
+
+<ParamField path="IgnoreAllowList" type="bool" default="false">
+  When `true`, requests that match an `AllowList` entry in `ThrottlingTrollConfig` are still subject to this rule. By default, allowlisted requests bypass all rules.
+</ParamField>
+
+<ParamField path="ErrorHandlingBehavior" type="ErrorHandlingBehavior">
+  Controls what happens when ThrottlingTroll encounters an internal error (e.g., the counter store is unavailable). `LogAndContinue` (default for most algorithms) silently allows the request; `ThrowExceptions` re-throws the exception and fails the request.
+</ParamField>
+
+## Examples
+
+### Controller-level and method-level attributes
+
+```csharp
+// 100 requests per minute for the entire controller
+[ThrottlingTroll(Algorithm = RateLimitAlgorithm.FixedWindow, PermitLimit = 100, IntervalInSeconds = 60)]
+[ApiController]
+[Route("api/[controller]")]
+public class OrdersController : ControllerBase
+{
+    // Tighter limit on the GET endpoint: 10 requests per second with a smooth sliding window
+    [HttpGet]
+    [ThrottlingTroll(
+        Algorithm = RateLimitAlgorithm.SlidingWindow,
+        PermitLimit = 10,
+        IntervalInSeconds = 1,
+        NumOfBuckets = 5)]
+    public IActionResult GetOrders() => Ok(new[] { "order1", "order2" });
+
+    // POST uses the controller-level limit only
+    [HttpPost]
+    public IActionResult CreateOrder([FromBody] object order) => Created("/api/orders/1", order);
+}
+```
+
+### Custom response text and status code
+
+```csharp
+[HttpGet("heavy")]
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.FixedWindow,
+    PermitLimit = 5,
+    IntervalInSeconds = 10,
+    ResponseStatusCode = 429,
+    ResponseBody = "You are sending too many requests. Please wait before retrying.",
+    Name = "heavy-endpoint-limit")]
+public IActionResult HeavyOperation() => Ok("done");
+```
+
+### Semaphore (concurrency limiter) for critical sections
+
+```csharp
+[HttpPost("report")]
+[ThrottlingTroll(
+    Algorithm = RateLimitAlgorithm.Semaphore,
+    PermitLimit = 3,
+    TimeoutInSeconds = 30)]
+public async Task<IActionResult> GenerateReport()
+{
+    await Task.Delay(5000); // simulated heavy work
+    return Ok();
+}
+```
+
+### Razor Page handler
+
+```csharp
+// Limits the OnPostAsync handler to 5 submissions per minute
+[ThrottlingTroll(Algorithm = RateLimitAlgorithm.FixedWindow, PermitLimit = 5, IntervalInSeconds = 60)]
+public class ContactModel : PageModel
+{
+    public async Task<IActionResult> OnPostAsync()
+    {
+        // handle form submission
+        return RedirectToPage("./Confirmation");
+    }
+}
+```
+
+## UriPattern auto-inference
+
+When you place `[ThrottlingTroll]` on a controller or method, ThrottlingTroll inspects `[Route]`, `[HttpGet]`, `[HttpPost]`, and similar attributes to build a regex URI pattern automatically. For example, a controller decorated with `[Route("api/[controller]")]` and a method decorated with `[HttpGet("{id}")]` produces the pattern `/api/orders/.*`. Route parameters like `{id}` are replaced with the `.*` wildcard.
+
+You only need to set `UriPattern` explicitly when:
+- The auto-inferred pattern is too broad or too narrow.
+- You are applying the attribute to a class that is **not** a controller or Razor Page (e.g., a minimal-API handler defined elsewhere).
+- You want to restrict the rule to a subset of routes that share the same controller.
+
+## Adding assemblies to scan
+
+By default, ThrottlingTroll scans the **calling assembly** — the project that calls `UseThrottlingTroll`. If your controllers or Razor Pages live in a separate class library, add that assembly to `ThrottlingTrollOptions.Assemblies`:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Assemblies = new List<Assembly>
+    {
+        Assembly.GetExecutingAssembly(),
+        typeof(OrdersController).Assembly,  // controllers in a separate library
+        typeof(ContactModel).Assembly       // Razor Pages in another library
+    };
+});
+```
+
+To **disable** declarative (attribute-based) configuration entirely, pass an empty list:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.Assemblies = new List<Assembly>(); // no attribute scanning
+});
+```
+
+<Note>
+  `[ThrottlingTroll]` supports `AttributeTargets.Class | AttributeTargets.Method` and is declared `AllowMultiple = true`, so you can stack multiple attributes on the same class or method to apply several independent rules simultaneously — for example a per-second burst limit alongside a per-minute sustained limit.
+</Note>
+
+<Tip>
+  Set `Name` to a meaningful string such as `"orders-read-per-minute"` to see that label in your OpenTelemetry distributed traces instead of a truncated hash. This makes it much easier to correlate a throttling event in a trace with the rule that triggered it.
+</Tip>

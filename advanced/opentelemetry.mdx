@@ -1,0 +1,149 @@
+---
+title: "OpenTelemetry Tracing and Metrics for ThrottlingTroll"
+sidebarTitle: "OpenTelemetry"
+description: "ThrottlingTroll emits OpenTelemetry traces and metrics. Subscribe to the ThrottlingTroll activity source and meter to integrate with Jaeger, Prometheus, or any OTel backend."
+---
+
+ThrottlingTroll is instrumented with OpenTelemetry out of the box. Every rule evaluation produces a trace span and every throttling decision increments a metric counter, giving you end-to-end production visibility with zero additional instrumentation code. All you need to do is subscribe to the `ThrottlingTroll` source in your OpenTelemetry pipeline.
+
+## Traces
+
+ThrottlingTroll publishes spans via an `ActivitySource` named **`ThrottlingTroll`**.
+
+### Span names
+
+| Span name | When created |
+|---|---|
+| `ThrottlingTroll.Ingress` | Once per incoming request, wrapping all rule evaluations |
+| `ThrottlingTroll.Rule.<name>` | Once per matched rule (nested inside the Ingress span) |
+| `ThrottlingTroll.Waiting` | When `MaxDelayInSeconds > 0` and the middleware is spin-waiting for a slot |
+| `ThrottlingTroll.CircuitBreakerRule.<name>` | When a CircuitBreaker rule checks or updates its failure counter |
+
+The `<name>` portion of a rule span comes from `ThrottlingTrollRule.Name`. When `Name` is not set, ThrottlingTroll uses a 10-character SHA-256 hash of the rule's filter fields — readable names make distributed traces far more useful.
+
+### Span attributes
+
+The following attributes are added automatically by ThrottlingTroll:
+
+| Attribute | Source |
+|---|---|
+| `ThrottlingTrollRule.UriString` | Exact URI pattern, if set |
+| `ThrottlingTrollRule.UriPattern` | Regex URI pattern, if set |
+| `ThrottlingTrollRule.Method` | HTTP method filter, if set |
+| `ThrottlingTrollRule.HeaderName` | Header name filter, if set |
+| `ThrottlingTrollRule.HeaderValue` | Header value filter, if set |
+| `ThrottlingTrollRule.IdentityId` | Identity ID, if extracted |
+| `ThrottlingTrollRule.MaxDelayInSeconds` | Delay budget for spin-waiting |
+| `ThrottlingTrollRule.LimitMethod` | Algorithm class name (e.g. `FixedWindowRateLimitMethod`) |
+| `LimitCheckResult.CounterId` | SHA-256-based unique counter key |
+| `LimitCheckResult.RequestsRemaining` | Permits left (negative when limit exceeded) |
+| `LimitCheckResult.RetryAfterHeaderValue` | Suggested `Retry-After` value |
+| `LimitCheckResult.RetryAfterInSeconds` | `Retry-After` as integer seconds |
+| `RequestCost` | Cost charged to this request |
+| `Result` | Human-readable outcome string |
+
+Each `RateLimitMethod` also adds its own tags (e.g. `FixedWindowRateLimitMethod.PermitLimit`, `FixedWindowRateLimitMethod.IntervalInSeconds`, `SemaphoreRateLimitMethod.TimeoutInSeconds`, and so on).
+
+### Subscribing to ThrottlingTroll traces
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing =>
+    {
+        tracing
+            .AddAspNetCoreInstrumentation()
+            .AddSource("ThrottlingTroll")   // subscribe to ThrottlingTroll spans
+            .AddJaegerExporter();
+    });
+```
+
+<Tip>
+Set `rule.Name` on every `ThrottlingTrollRule` you define. When a rule has a name, every span and metric tag uses that name verbatim. Without it, span names contain an opaque hash like `ThrottlingTroll.Rule.XyZ1234abc`, which is hard to correlate in Jaeger or Zipkin.
+
+```csharp
+new ThrottlingTrollRule
+{
+    Name = "PerUserLoginLimit",   // shows up clearly in traces
+    UriPattern = "/api/login",
+    LimitMethod = new SlidingWindowRateLimitMethod
+    {
+        PermitLimit = 5,
+        IntervalInSeconds = 60,
+        NumOfBuckets = 6
+    }
+}
+```
+</Tip>
+
+---
+
+## Metrics
+
+ThrottlingTroll publishes metrics via a `Meter` named **`ThrottlingTroll`**.
+
+### Available counters
+
+| Counter name | Description |
+|---|---|
+| `throttlingtroll.ingress.rules_matched` | Number of times an ingress rule was matched by an incoming request |
+| `throttlingtroll.ingress.requests_throttled` | Number of incoming requests that were rejected (limit exceeded) |
+| `throttlingtroll.egress.rules_matched` | Number of times an egress rule was matched by an outgoing request |
+| `throttlingtroll.egress.requests_throttled` | Number of outgoing requests that were throttled |
+| `throttlingtroll.internal_failures` | Number of internal errors inside ThrottlingTroll's rule evaluation |
+| `throttlingtroll.get_config_func_successes` | Number of successful calls to `GetConfigFunc` (reactive config polling) |
+| `throttlingtroll.get_config_func_failures` | Number of failed calls to `GetConfigFunc` |
+
+Each `rules_matched` and `requests_throttled` counter carries two tags:
+
+- `throttlingtroll.rule` — the rule name (or its hash, if `Name` is not set)
+- `throttlingtroll.counter_id` — the full counter key (rule hash + optional identity ID)
+
+### Subscribing to ThrottlingTroll metrics
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics =>
+    {
+        metrics
+            .AddAspNetCoreInstrumentation()
+            .AddMeter("ThrottlingTroll")    // subscribe to ThrottlingTroll metrics
+            .AddPrometheusExporter();
+    });
+```
+
+### Using metrics for autoscaling
+
+Because `throttlingtroll.ingress.requests_throttled` counts requests that your service *refused*, a rising value indicates your fleet is undersized for the current load. You can feed this counter into your platform's autoscaler:
+
+- **Azure Monitor / KEDA** — export to Azure Monitor via `AddAzureMonitorMetricExporter()`, then create an autoscale rule on the `throttlingtroll.ingress.requests_throttled` metric.
+- **Kubernetes HPA** — export to Prometheus with `.AddPrometheusExporter()` and create a custom-metrics HPA targeting the same counter.
+- **AWS CloudWatch** — export via `OpenTelemetry.Exporter.OpenTelemetryProtocol` pointed at an ADOT collector.
+
+A sensible baseline: if `requests_throttled / rules_matched` exceeds **10 %** over a 5-minute window, trigger a scale-out event.
+
+---
+
+## Logging
+
+ThrottlingTroll logs through the standard `ILogger<ThrottlingTrollCore>` integration. In ASP.NET apps this is wired up automatically when you call `UseThrottlingTroll`:
+
+```csharp
+// In ThrottlingTroll.AspNet, the logger is resolved from DI automatically:
+var logger = builder.ApplicationServices.GetService<ILogger<ThrottlingTrollCore>>();
+opt.Log = logger == null ? null : (l, s) => logger.Log(l, s);
+```
+
+### Log levels and messages
+
+| Level | Situation | Message format |
+|---|---|---|
+| `Warning` | A rule was exceeded by a request | `ThrottlingTroll: rule {counterId} exceeded by {method} {uriWithoutQueryString}` |
+| `Warning` | HttpContext already disposed when writing `LimitCheckResults` | `ThrottlingTroll failed to populate request context with LimitCheckResults. {ex}` |
+| `Information` | A request matched the allowlist | `ThrottlingTroll allowlisted {method} {uri}` |
+| `Error` | Config could not be fetched | `ThrottlingTroll failed to get its config. {ex}` |
+| `Error` | Internal failure during rule evaluation | `ThrottlingTroll failed. {ex}` |
+| `Error` | Counter decrement failed on request completion | `ThrottlingTroll failed. {ex}` |
+
+<Note>
+`ShouldThrowOnFailures` defaults to `false` for all rate limit methods except `SemaphoreRateLimitMethod`, which defaults to `true`. When `false`, internal errors are swallowed and only produce a log entry at `Error` level; the request is allowed through rather than failing. The `throttlingtroll.internal_failures` metric counter increments regardless of this setting.
+</Note>

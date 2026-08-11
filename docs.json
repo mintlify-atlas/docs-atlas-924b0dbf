@@ -1,72 +1,92 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "ThrottlingTroll",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#044c84"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/04d7cd72-a372-4cff-9ce6-24ee8db0cbb2.png",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ThrottlingTroll/ThrottlingTroll"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/ThrottlingTroll/ThrottlingTroll"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart-aspnet",
+              "quickstart-azure-functions",
+              "quickstart-generic-dotnet"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/declarative",
+              "configuration/static",
+              "configuration/programmatic",
+              "configuration/reactive"
+            ]
+          },
+          {
+            "group": "Ingress Throttling",
+            "pages": [
+              "ingress/overview",
+              "ingress/identity-and-cost",
+              "ingress/delays-and-responses",
+              "ingress/request-deduplication"
+            ]
+          },
+          {
+            "group": "Egress Throttling",
+            "pages": [
+              "egress/overview",
+              "egress/delays-and-retries",
+              "egress/propagation"
+            ]
+          },
+          {
+            "group": "Counter Stores",
+            "pages": [
+              "counter-stores/overview",
+              "counter-stores/redis",
+              "counter-stores/azure-table",
+              "counter-stores/distributed-cache",
+              "counter-stores/ef-core"
+            ]
+          },
+          {
+            "group": "Algorithms",
+            "pages": [
+              "algorithms/fixed-window",
+              "algorithms/sliding-window",
+              "algorithms/leaky-bucket",
+              "algorithms/semaphore",
+              "algorithms/circuit-breaker"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/opentelemetry",
+              "advanced/distributed-locks",
+              "advanced/custom-counter-store"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

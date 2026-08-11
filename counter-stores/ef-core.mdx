@@ -1,0 +1,141 @@
+---
+title: "EF Core Counter Store for ThrottlingTroll SQL-Backed Rate Limiting"
+sidebarTitle: "EF Core"
+description: "Use EfCoreCounterStore to persist ThrottlingTroll rate limit counters in any EF Core-supported database, including SQL Server, PostgreSQL, and SQLite."
+---
+
+`EfCoreCounterStore` stores rate limit counters in a relational database through [Entity Framework Core](https://learn.microsoft.com/en-us/ef/core/), making it compatible with any database that has an EF Core provider — SQL Server, PostgreSQL, MySQL, SQLite, and more. It uses `RepeatableRead` transactions and raw SQL increments to keep counter updates as atomic as the underlying database allows, and runs a background cleanup routine to remove expired rows automatically.
+
+## Installation
+
+```bash
+dotnet add package ThrottlingTroll.CounterStores.EfCore
+```
+
+You also need to install the EF Core provider for your target database. For example, for SQL Server:
+
+```bash
+dotnet add package Microsoft.EntityFrameworkCore.SqlServer
+```
+
+## Create the Counter Table
+
+Before deploying, create the `ThrottlingTrollCounters` table in your database. The table must have a primary key on `Id` — this is required for the atomic `UPDATE … WHERE Id = '…'` pattern used internally.
+
+```sql
+CREATE TABLE ThrottlingTrollCounters
+(
+    [Id]        [nvarchar](255)      PRIMARY KEY,
+    [Count]     [bigint]             NOT NULL,
+    [ExpiresAt] [datetimeoffset]     NOT NULL
+);
+```
+
+For other databases, adjust the column types to match their equivalents (e.g. `VARCHAR`, `BIGINT`, `TIMESTAMP WITH TIME ZONE`).
+
+## Constructor
+
+```csharp
+public EfCoreCounterStore(
+    Action<DbContextOptionsBuilder> efConfigFunc,
+    EfCoreCounterStoreSettings settings = null)
+```
+
+The first argument is a delegate that configures EF Core with your chosen database provider and connection string — exactly the same delegate you would pass to `DbContext.OnConfiguring`. The second argument is an optional `EfCoreCounterStoreSettings` instance for tuning retry and cleanup behaviour.
+
+## Registration
+
+### Via Dependency Injection (recommended)
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using ThrottlingTroll;
+using ThrottlingTroll.CounterStores.EfCore;
+
+builder.Services.AddSingleton<ICounterStore>(
+    new EfCoreCounterStore(efConfig =>
+    {
+        efConfig.UseSqlServer(
+            builder.Configuration.GetConnectionString("DefaultConnection")
+        );
+    })
+);
+```
+
+### Via `ThrottlingTrollOptions`
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.CounterStore = new EfCoreCounterStore(efConfig =>
+    {
+        efConfig.UseSqlServer(
+            app.Configuration.GetConnectionString("DefaultConnection")
+        );
+    });
+});
+```
+
+### PostgreSQL example
+
+```csharp
+builder.Services.AddSingleton<ICounterStore>(
+    new EfCoreCounterStore(efConfig =>
+    {
+        efConfig.UseNpgsql(
+            builder.Configuration.GetConnectionString("Postgres")
+        );
+    })
+);
+```
+
+## Tuning with `EfCoreCounterStoreSettings`
+
+Pass an `EfCoreCounterStoreSettings` instance to override the defaults:
+
+```csharp
+builder.Services.AddSingleton<ICounterStore>(
+    new EfCoreCounterStore(
+        efConfig => efConfig.UseSqlServer(connectionString),
+        new EfCoreCounterStoreSettings
+        {
+            RunCleanupEveryMinutes = 5,
+            DeleteExpiredCountersAfterMinutes = 30,
+            MaxAttempts = 15,
+            MaxDelayBetweenAttemptsInMilliseconds = 200
+        }
+    )
+);
+```
+
+| Property | Default | Description |
+|---|---|---|
+| `RunCleanupEveryMinutes` | `1` | How often the background cleanup routine runs |
+| `DeleteExpiredCountersAfterMinutes` | `10` | How long after expiry before a row is deleted |
+| `MaxAttempts` | `10` | Maximum retry attempts for transient DB errors |
+| `MaxDelayBetweenAttemptsInMilliseconds` | `100` | Upper bound for the random back-off delay between retries |
+
+## Data Model
+
+The store uses a single `CounterDbContext` with one `DbSet`:
+
+```csharp
+public class ThrottlingTrollCounter
+{
+    public string Id { get; set; }        // Counter key (PRIMARY KEY)
+    public long Count { get; set; }       // Current request count
+    public DateTimeOffset ExpiresAt { get; set; } // Absolute expiry time
+}
+```
+
+## Automatic Cleanup
+
+`EfCoreCounterStore` runs a background cleanup task (fire-and-forget) every `RunCleanupEveryMinutes` minutes. It first marks rows expired more than `DeleteExpiredCountersAfterMinutes` minutes ago by setting their `ExpiresAt` to `DateTimeOffset.MinValue` (within a `RepeatableRead` transaction to avoid deleting a row mid-update), then deletes those marked rows in a second statement. This two-step approach prevents the cleanup from racing with in-flight counter updates.
+
+<Note>
+  Every counter operation opens a database connection and runs at least one SQL statement. Under high request rates this adds latency and can create contention on the counter rows. `EfCoreCounterStore` is best suited for **low-to-moderate traffic** scenarios where you already have a relational database and want to avoid introducing a separate caching infrastructure. For high-throughput workloads, use [`RedisCounterStore`](/counter-stores/redis).
+</Note>
+
+<Tip>
+  Create the `ThrottlingTrollCounters` table as part of your deployment pipeline before the application starts. If the table is missing, the store will throw on the first request. You can also manage the schema through EF Core migrations by deriving from `CounterDbContext` and adding it to your regular migration workflow.
+</Tip>

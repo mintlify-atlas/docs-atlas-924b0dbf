@@ -1,0 +1,200 @@
+---
+title: "Reactive Configuration: Hot-Reload ThrottlingTroll Rules Without Restart"
+sidebarTitle: "Reactive"
+description: "Use GetConfigFunc and IntervalToReloadConfigInSeconds to reload ThrottlingTroll rate limiting rules at runtime, without restarting your service."
+---
+
+Reactive configuration enables ThrottlingTroll to pick up new or changed rate limiting rules while the service is running, without any restart or redeployment. You provide an async delegate (`GetConfigFunc`) that returns a fresh `ThrottlingTrollConfig`, and optionally set `IntervalToReloadConfigInSeconds` to have ThrottlingTroll poll that delegate on a background timer. Each time the delegate returns a new config, the active rule set is replaced atomically — in-flight requests continue to use the old rules until they complete, while new requests are evaluated against the updated set.
+
+## Basic setup
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.GetConfigFunc = async () =>
+    {
+        // Load from a database, Azure App Configuration, Redis, or any source
+        var rules = await myConfigRepository.GetRateLimitRulesAsync();
+        return new ThrottlingTrollConfig { Rules = rules };
+    };
+
+    // Re-invoke GetConfigFunc every 30 seconds
+    options.IntervalToReloadConfigInSeconds = 30;
+});
+```
+
+`GetConfigFunc` is called once at startup regardless of `IntervalToReloadConfigInSeconds`. After that, when `IntervalToReloadConfigInSeconds` is greater than `0`, the delegate is called again on a background timer at the specified interval. Setting `IntervalToReloadConfigInSeconds` to `0` (the default) means the delegate is called exactly once — useful when you want to load rules asynchronously at startup without ongoing polling.
+
+## How the reload works
+
+ThrottlingTroll's internal timer invokes `GetConfigFunc` on the configured interval. The result is merged with any static `Config` and any rules discovered through `[ThrottlingTroll]` attributes (which are fixed at startup). The merged config then becomes active for all subsequent requests. The switch is atomic from the perspective of rule evaluation — no request sees a partially-applied config.
+
+<Note>
+  `GetConfigFunc` replaces only the portion of the active config that it controls. Rules defined in `Config` (the static programmatic config) and rules collected from `[ThrottlingTroll]` attributes are fixed at startup and are re-merged on every reload. This means that if `GetConfigFunc` returns a config with a `UniqueName`, that name overrides any `UniqueName` set in `Config`.
+</Note>
+
+## Loading from a database
+
+A common pattern is to store rate limit rules in a database table and expose them through a repository:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.GetConfigFunc = async () =>
+    {
+        await using var scope = app.Services.CreateAsyncScope();
+        var repo = scope.ServiceProvider.GetRequiredService<IRateLimitRuleRepository>();
+        var rules = await repo.GetActiveRulesAsync();
+
+        return new ThrottlingTrollConfig
+        {
+            UniqueName = "my-service",
+            Rules = rules.Select(r => new ThrottlingTrollRule
+            {
+                UriPattern = r.UriPattern,
+                Method = r.Method,
+                LimitMethod = new FixedWindowRateLimitMethod
+                {
+                    PermitLimit = r.PermitLimit,
+                    IntervalInSeconds = r.IntervalInSeconds
+                }
+            }).ToList()
+        };
+    };
+
+    options.IntervalToReloadConfigInSeconds = 60;
+});
+```
+
+## Loading from Azure App Configuration
+
+Azure App Configuration pairs naturally with reactive ThrottlingTroll: store your limit values as configuration entries and reload them on a short interval.
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.GetConfigFunc = async () =>
+    {
+        // IConfiguration is refreshed by Azure App Configuration's built-in refresh
+        var config = app.Services.GetRequiredService<IConfiguration>();
+
+        return new ThrottlingTrollConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "/api/",
+                    LimitMethod = new SlidingWindowRateLimitMethod
+                    {
+                        PermitLimit = config.GetValue<int>("RateLimits:Api:PermitLimit", 100),
+                        IntervalInSeconds = config.GetValue<double>("RateLimits:Api:IntervalInSeconds", 60),
+                        NumOfBuckets = config.GetValue<int>("RateLimits:Api:NumOfBuckets", 6)
+                    }
+                }
+            ]
+        };
+    };
+
+    options.IntervalToReloadConfigInSeconds = 30;
+});
+```
+
+## Using ThrottlingTrollConfig.FromConfigSection
+
+`ThrottlingTrollConfig.FromConfigSection` is a static helper that reads a `ThrottlingTrollConfig` directly from an `IConfiguration` section. Use it inside `GetConfigFunc` when you want ThrottlingTroll to re-read `appsettings.json` (or any other `IConfiguration` source) on each poll cycle rather than only once at startup:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.GetConfigFunc = ThrottlingTrollConfig.FromConfigSection(
+        app.Services,
+        "ThrottlingTrollIngress"
+    ).AsAsyncFunc();
+
+    options.IntervalToReloadConfigInSeconds = 30;
+});
+```
+
+Alternatively, if you need to compose the config manually before returning it:
+
+```csharp
+app.UseThrottlingTroll(options =>
+{
+    options.GetConfigFunc = async () =>
+    {
+        var fromFile = ThrottlingTrollConfig.FromConfigSection(
+            app.Services,
+            "ThrottlingTrollIngress"
+        );
+
+        // Augment with a hard-coded emergency rule
+        fromFile ??= new ThrottlingTrollConfig();
+        fromFile.Rules ??= new List<ThrottlingTrollRule>();
+        fromFile.Rules.Add(new ThrottlingTrollRule
+        {
+            UriPattern = "/api/expensive",
+            LimitMethod = new FixedWindowRateLimitMethod { PermitLimit = 5, IntervalInSeconds = 1 }
+        });
+
+        return fromFile;
+    };
+
+    options.IntervalToReloadConfigInSeconds = 60;
+});
+```
+
+## IOptionsMonitor as an alternative
+
+If your application already uses `IOptionsMonitor<T>` to react to `appsettings.json` changes (e.g., via the `Microsoft.Extensions.Configuration.Json` file-watcher), you can drive ThrottlingTroll reloads from `OnChange` callbacks rather than from polling:
+
+```csharp
+builder.Services.Configure<RateLimitSettings>(
+    builder.Configuration.GetSection("RateLimits"));
+
+// ... in middleware setup:
+app.UseThrottlingTroll(options =>
+{
+    var monitor = app.Services.GetRequiredService<IOptionsMonitor<RateLimitSettings>>();
+
+    options.GetConfigFunc = () =>
+    {
+        var settings = monitor.CurrentValue;
+        return Task.FromResult(new ThrottlingTrollConfig
+        {
+            Rules =
+            [
+                new ThrottlingTrollRule
+                {
+                    UriPattern = "/api/",
+                    LimitMethod = new FixedWindowRateLimitMethod
+                    {
+                        PermitLimit = settings.PermitLimit,
+                        IntervalInSeconds = settings.IntervalInSeconds
+                    }
+                }
+            ]
+        });
+    };
+
+    // Keep polling so the middleware regularly picks up any monitor changes
+    options.IntervalToReloadConfigInSeconds = 5;
+});
+```
+
+## How all four config methods combine
+
+ThrottlingTroll always merges all four configuration sources before evaluating a request:
+
+| Source | When evaluated | Mutable at runtime |
+|---|---|---|
+| `[ThrottlingTroll]` attributes | Once at startup | No |
+| `appsettings.json` / `ConfigSectionName` | Once at startup (or on each `GetConfigFunc` poll when using `FromConfigSection`) | Only via polling |
+| `Config` (programmatic static) | Once at startup | No |
+| `GetConfigFunc` | At startup, then every `IntervalToReloadConfigInSeconds` | Yes |
+
+Rules from all sources are concatenated via `ThrottlingTrollConfig.MergeWith`. A request must satisfy **all** matched rules' limits — if any rule is exceeded, the request is rejected.
+
+<Tip>
+  If `UniqueName` changes between two `GetConfigFunc` invocations, counters stored under the old prefix are immediately abandoned — they stay in the counter store until they expire naturally but are no longer incremented or checked. New counters are started fresh under the new prefix, effectively resetting all quotas for that service. Use this intentionally to implement an "emergency quota reset" by temporarily changing `UniqueName` via your external config store.
+</Tip>

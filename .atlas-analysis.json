@@ -1,0 +1,124 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "ThrottlingTroll",
+  "projectDescription": "A rate limiting, throttling, and circuit-breaking middleware library for ASP.NET Core, Azure Functions, and any .NET application, with support for Redis and other distributed counter stores.",
+  "theme": "aspen",
+  "primaryColor": "#044c84",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart-aspnet",
+              "quickstart-azure-functions",
+              "quickstart-generic-dotnet"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/declarative",
+              "configuration/static",
+              "configuration/programmatic",
+              "configuration/reactive"
+            ]
+          },
+          {
+            "group": "Ingress Throttling",
+            "pages": [
+              "ingress/overview",
+              "ingress/identity-and-cost",
+              "ingress/delays-and-responses",
+              "ingress/request-deduplication"
+            ]
+          },
+          {
+            "group": "Egress Throttling",
+            "pages": [
+              "egress/overview",
+              "egress/delays-and-retries",
+              "egress/propagation"
+            ]
+          },
+          {
+            "group": "Counter Stores",
+            "pages": [
+              "counter-stores/overview",
+              "counter-stores/redis",
+              "counter-stores/azure-table",
+              "counter-stores/distributed-cache",
+              "counter-stores/ef-core"
+            ]
+          },
+          {
+            "group": "Algorithms",
+            "pages": [
+              "algorithms/fixed-window",
+              "algorithms/sliding-window",
+              "algorithms/leaky-bucket",
+              "algorithms/semaphore",
+              "algorithms/circuit-breaker"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/opentelemetry",
+              "advanced/distributed-locks",
+              "advanced/custom-counter-store"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Ingress throttling: auto-respond 429 TooManyRequests to over-quota clients",
+    "Egress throttling: limit outbound calls via HttpClient DelegatingHandler",
+    "Egress-to-ingress propagation of 429 responses",
+    "Five rate limiting algorithms: FixedWindow, SlidingWindow, LeakyBucket, Semaphore, CircuitBreaker",
+    "Four configuration methods: declarative (attributes), static (appsettings.json), programmatic, and reactive (hot-reload)",
+    "IdentityIdExtractors for per-client rate limiting (IP, API key, header, claim, etc.)",
+    "CostExtractors for weighted request costs and pricing tiers",
+    "Distributed counter stores: Redis, Azure Table, IDistributedCache, EF Core",
+    "Request deduplication via Semaphore with ReleaseAfterSeconds",
+    "Custom response fabrics: delayed responses, spin-waits, and fully custom HTTP responses",
+    "OpenTelemetry traces and metrics",
+    "Generic .NET support via IThrottlingTroll for use in any .NET app"
+  ],
+  "publicApiSurface": [
+    "IApplicationBuilder.UseThrottlingTroll(Action<ThrottlingTrollOptions>)",
+    "IServiceCollection.AddThrottlingTroll(Action<ThrottlingTrollOptions>)",
+    "IHostBuilder.UseThrottlingTroll(Action<ThrottlingTrollOptions>)",
+    "IHttpClientBuilder.AddThrottlingTrollMessageHandler(Action<ThrottlingTrollOptions>)",
+    "IThrottlingTroll.WithThrottlingTroll<T>(Func<ThrottlingTrollContext, Task<T>>, Func<ThrottlingTrollContext, Task<T>>, string)",
+    "IThrottlingTroll.GetCurrentConfig()",
+    "ThrottlingTrollAttribute (Algorithm, PermitLimit, IntervalInSeconds, MaxDelayInSeconds, ResponseBody, ResponseStatusCode, ...)",
+    "ThrottlingTrollConfig (Rules, AllowList, UniqueName)",
+    "ThrottlingTrollRule (LimitMethod, MaxDelayInSeconds, CostExtractor, ResponseFabric, IdentityIdExtractor, ...)",
+    "ThrottlingTrollOptions (Config, GetConfigFunc, IntervalToReloadConfigInSeconds, CounterStore, IdentityIdExtractor, CostExtractor, ResponseFabric, Assemblies)",
+    "ThrottlingTrollEgressConfig (PropagateToIngress)",
+    "ThrottlingTrollContext (LimitCheckResults, ExceededLimit, ShouldContinueAsNormal)",
+    "LimitCheckResult (RequestsRemaining, RetryAfterHeaderValue, RetryAfterInSeconds, CounterId, Rule)",
+    "FixedWindowRateLimitMethod (PermitLimit, IntervalInSeconds)",
+    "SlidingWindowRateLimitMethod (PermitLimit, IntervalInSeconds, NumOfBuckets)",
+    "LeakyBucketRateLimitMethod (PermitLimit, IntervalInSeconds)",
+    "SemaphoreRateLimitMethod (PermitLimit, TimeoutInSeconds, ReleaseAfterSeconds)",
+    "CircuitBreakerRateLimitMethod (PermitLimit, IntervalInSeconds, TrialIntervalInSeconds)",
+    "ICounterStore (GetAsync, IncrementAndGetAsync, DecrementAsync)",
+    "RedisCounterStore",
+    "AzureTableCounterStore",
+    "DistributedCacheCounterStore",
+    "EfCoreCounterStore",
+    "MemoryCacheCounterStore",
+    "RequestFilter (UriString, UriPattern, Method, HeaderName, HeaderValue, HeaderValuePattern, IdentityId, IdentityIdExtractor)",
+    "HttpContext.GetThrottlingTrollConfig()",
+    "HttpContext.GetThrottlingTrollLimitCheckResults()"
+  ]
+}
